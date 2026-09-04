@@ -107,24 +107,24 @@ jobs:
         run: |
           ./mvnw clean package -DskipTests -T 1C
 
-          test -e build-target
+          test -d build-target
           test -d fluss-dist/target
 
-          echo "---- build-target entry type ----"
-          # build-target is commonly a symlink into fluss-dist/target/...;
-          # report that explicitly so a future failure here is obvious
-          # from the logs instead of surfacing as a mystifying Docker
-          # "not found" error three steps later.
-          ls -ld build-target
+          echo "---- build-target link check ----"
+          # build-target is typically a symlink into fluss-dist/target/... —
+          # report that explicitly so a dangling-symlink bug (see the next
+          # step) is obvious from this log instead of surfacing three steps
+          # downstream as a BuildKit "not found" error.
           if [ -L build-target ]; then
             echo "build-target is a symlink -> $(readlink -f build-target)"
-            test -d "$(readlink -f build-target)"
+          else
+            echo "build-target is a real directory"
           fi
 
           echo "---- Fluss distribution ----"
           find fluss-dist/target -maxdepth 1 -type f -print
 
-          echo "---- build-target contents ----"
+          echo "---- build-target ----"
           find build-target -maxdepth 2 -type f | head -100
 
       - name: Prepare Fluss Docker build context
@@ -134,28 +134,22 @@ jobs:
 
           cp -a docker/fluss/Dockerfile /tmp/fluss-docker-context/
           cp -a docker/fluss/docker-entrypoint.sh /tmp/fluss-docker-context/
-
-          # IMPORTANT: build-target is typically a symlink (e.g. into
-          # fluss-dist/target/fluss-<version>-bin/fluss-<version>). `cp -a`
-          # preserves symlinks rather than following them (-a implies -d,
-          # i.e. --no-dereference), so it copies a dangling link into the
-          # temp context instead of the real directory tree. BuildKit then
-          # can't resolve `COPY build-target/` and fails with
-          # "failed to calculate checksum of ref ...: /build-target: not found".
-          #
-          # Use -L (or --dereference) to copy the symlink's *target*
-          # contents instead of the link itself.
+          # -L dereferences the build-target symlink so BuildKit gets a real
+          # directory tree in its build context instead of a dangling link
+          # (cp -a alone copies the symlink itself, which -- once outside
+          # the original repo layout -- points nowhere and makes the later
+          # `docker build` fail with "/build-target: not found").
           cp -aL build-target /tmp/fluss-docker-context/build-target
 
           echo "---- Docker context ----"
           du -sh /tmp/fluss-docker-context
           test -d /tmp/fluss-docker-context/build-target
-          # Fail loudly here, not three steps later, if the copy produced
-          # an empty directory for any reason.
-          test -n "$(find /tmp/fluss-docker-context/build-target -maxdepth 1 -mindepth 1)"
-          find /tmp/fluss-docker-context/build-target -maxdepth 2 -type f | head -20
           test -f /tmp/fluss-docker-context/Dockerfile
           test -f /tmp/fluss-docker-context/docker-entrypoint.sh
+          # Fail loudly here rather than inside `docker build` if the
+          # dereferenced copy is somehow empty.
+          [ -n "$(find /tmp/fluss-docker-context/build-target -maxdepth 1 -mindepth 1)" ] \
+            || { echo "build-target copy is empty after dereferencing" >&2; exit 1; }
 
       - name: Build Fluss Docker image
         run: |
@@ -177,23 +171,18 @@ jobs:
 
       # ------------------------------------------------------------
       # Pull only the images that actually come from a registry.
-      #
-      # coordinator-server/tablet-server (apache/fluss:$FLUSS_DOCKER_VERSION$)
-      # and gateway (fluss-gateway:dev) were built locally in the previous
-      # two steps, not via a `build:` key in the compose file — so
-      # `--ignore-buildable` doesn't skip them, and `docker compose pull`
-      # tries to fetch apache/fluss:1.0-SNAPSHOT / fluss-gateway:dev from
-      # the registry, where neither exists, aborting the whole pull.
-      # List only the services that are genuinely meant to come from a
-      # registry; compose will use the already-present local images for
-      # the rest when `up -d` runs.
+      # coordinator-server/tablet-server (apache/fluss:<version>) and
+      # gateway (fluss-gateway:dev) were just built locally above, and
+      # neither is published anywhere -- `docker compose pull` on the bare
+      # `image:` reference would otherwise try to fetch them from Docker
+      # Hub, 404, and abort the pull for every other service too.
       # ------------------------------------------------------------
       - name: Pull Compose images
         run: |
           docker compose \
             -f /tmp/gateway-lakehouse-compose.yaml \
             pull --ignore-buildable \
-            zookeeper rustfs rustfs-init jobmanager taskmanager sql-client
+            rustfs rustfs-init zookeeper jobmanager taskmanager sql-client
 
       # ------------------------------------------------------------
       # Start stack.
@@ -269,33 +258,6 @@ jobs:
           curl -sS --fail-with-body http://localhost:8080/ready
 
       # ------------------------------------------------------------
-      # Diagnostic: get ground truth from the running Gateway itself
-      # instead of trusting the docs' URL shape a second time. This
-      # step never fails the job (no `set -e`, curls don't use --fail)
-      # so its output is always visible in the logs even if later
-      # steps 404 again.
-      # ------------------------------------------------------------
-      - name: Inspect Gateway API surface
-        shell: bash
-        run: |
-          echo "---- Gateway OpenAPI spec (ground truth for actual routes) ----"
-          curl -sS http://localhost:8080/v1/openapi.json \
-            | (command -v jq >/dev/null 2>&1 && jq . || cat)
-
-          echo ""
-          echo "---- Gateway container logs (startup / cluster registration) ----"
-          docker compose \
-            -f /tmp/gateway-lakehouse-compose.yaml \
-            logs --tail=150 gateway
-
-          echo ""
-          echo "---- Raw response for POST /v1/clusters/default/databases (diagnostic only) ----"
-          curl -sS -i -X POST \
-            -H 'Content-Type: application/json' \
-            http://localhost:8080/v1/clusters/default/databases \
-            -d '{"database": "gateway_demo_probe"}' || true
-
-      # ------------------------------------------------------------
       # Download Paimon S3 bundle into the SQL client container.
       # ------------------------------------------------------------
       - name: Download Paimon S3 jar
@@ -310,31 +272,71 @@ jobs:
           test -s /tmp/paimon-s3.jar
 
       # ------------------------------------------------------------
-      # Create database through Gateway REST API.
+      # Shared retry helper for Gateway writes.
+      #
+      # /health and /ready do not verify Fluss connectivity (documented in
+      # website/docs/gateway/index.md), so the Gateway can report "ready"
+      # while it is still retrying its connection to coordinator-server in
+      # the background. Two distinct symptoms of that same underlying race
+      # have been observed against this stack:
+      #
+      #   - HTTP 503, `unavailable` -- the connection to Fluss hasn't been
+      #     established at all yet.
+      #   - HTTP 400, `invalid_argument`, with the message "Fluss rejected
+      #     the request while trying to connect to Fluss" -- seen once the
+      #     TCP connection succeeds but the coordinator hasn't finished its
+      #     own startup (metadata/leader init) and rejects the RPC. This
+      #     code does not match its own OpenAPI spec's documented meaning
+      #     for 400 ("malformed body or invalid definition") given the
+      #     request body is schema-valid, which points to this being a
+      #     generic fallback the Gateway uses for an RPC error it doesn't
+      #     have a more specific mapping for -- not a real client error.
+      #
+      # Retry BOTH signatures with backoff. Anything else fails immediately
+      # with the full response body, so a genuine error is never masked.
       # ------------------------------------------------------------
-      - name: Create database
+      - name: Write Gateway retry helper
         shell: bash
         run: |
-          # /ready (checked in the previous step) doesn't verify Fluss
-          # connectivity - the Gateway can return 503 for a while after
-          # startup while it's still connecting to coordinator-server.
-          # Retry specifically on 503 rather than treating it as fatal.
+          cat >/tmp/gateway_request.sh <<'SCRIPT'
+          #!/usr/bin/env bash
+          # Usage: gateway_request.sh <METHOD> <URL> [DATA_FILE]
+          # Retries on:
+          #   - HTTP 503 (Fluss unavailable / gateway still starting)
+          #   - HTTP 400 with code=invalid_argument AND a message containing
+          #     "while trying to connect to Fluss" (coordinator not fully up
+          #     yet, mislabeled by the Gateway as a client error)
+          # Fails immediately, printing the full response body, on any other
+          # status or error signature.
+          set -euo pipefail
+
+          METHOD="$1"
+          URL="$2"
+          DATA_FILE="${3:-}"
+
           MAX_ATTEMPTS=30
           SLEEP_SECONDS=3
+          RESPONSE_FILE="$(mktemp)"
 
           for i in $(seq 1 "$MAX_ATTEMPTS"); do
-            http_code="$(
-              curl -sS -o /tmp/create-db-response.json -w '%{http_code}' \
-                -X POST \
-                http://localhost:8080/v1/clusters/default/databases \
-                -H 'Content-Type: application/json' \
-                -d '{"database": "gateway_demo"}'
-            )"
+            if [[ -n "$DATA_FILE" ]]; then
+              http_code="$(
+                curl -sS -o "$RESPONSE_FILE" -w '%{http_code}' \
+                  -X "$METHOD" "$URL" \
+                  -H 'Content-Type: application/json' \
+                  --data "@${DATA_FILE}"
+              )"
+            else
+              http_code="$(
+                curl -sS -o "$RESPONSE_FILE" -w '%{http_code}' -X "$METHOD" "$URL"
+              )"
+            fi
 
             if [[ "$http_code" == 2* ]]; then
-              echo "Database created (HTTP $http_code)"
-              cat /tmp/create-db-response.json
-              break
+              echo "Succeeded (HTTP $http_code)"
+              cat "$RESPONSE_FILE"
+              rm -f "$RESPONSE_FILE"
+              exit 0
             fi
 
             if [[ "$http_code" == "503" ]]; then
@@ -343,15 +345,46 @@ jobs:
               continue
             fi
 
-            echo "Create database failed with unexpected HTTP $http_code:"
-            cat /tmp/create-db-response.json
+            if [[ "$http_code" == "400" ]] \
+                && [[ "$(jq -r '.error.code // empty' "$RESPONSE_FILE" 2>/dev/null)" == "invalid_argument" ]] \
+                && jq -e '.error.message // "" | test("while trying to connect to Fluss")' "$RESPONSE_FILE" >/dev/null 2>&1; then
+              echo "Coordinator not fully initialized yet (HTTP 400, invalid_argument) - retrying ($i/$MAX_ATTEMPTS)..."
+              cat "$RESPONSE_FILE"
+              sleep "$SLEEP_SECONDS"
+              continue
+            fi
+
+            echo "Request failed with unexpected HTTP $http_code:"
+            cat "$RESPONSE_FILE"
+            rm -f "$RESPONSE_FILE"
             exit 1
           done
 
-          if [[ "$http_code" != 2* ]]; then
-            echo "Gateway never became ready to reach Fluss after $((MAX_ATTEMPTS * SLEEP_SECONDS))s"
-            exit 1
-          fi
+          echo "Gateway never became ready to reach Fluss after $((MAX_ATTEMPTS * SLEEP_SECONDS))s"
+          cat "$RESPONSE_FILE"
+          rm -f "$RESPONSE_FILE"
+          exit 1
+          SCRIPT
+
+          chmod +x /tmp/gateway_request.sh
+
+      # ------------------------------------------------------------
+      # Create database through Gateway REST API.
+      # ------------------------------------------------------------
+      - name: Create database
+        shell: bash
+        run: |
+          set -e
+
+          cat >/tmp/create-db.json <<'JSON'
+          {
+            "database": "gateway_demo"
+          }
+          JSON
+
+          /tmp/gateway_request.sh POST \
+            http://localhost:8080/v1/clusters/default/databases \
+            /tmp/create-db.json
 
       # ------------------------------------------------------------
       # Create lake-enabled table through Gateway REST API.
@@ -410,39 +443,9 @@ jobs:
           }
           JSON
 
-          MAX_ATTEMPTS=30
-          SLEEP_SECONDS=3
-
-          for i in $(seq 1 "$MAX_ATTEMPTS"); do
-            http_code="$(
-              curl -sS -o /tmp/create-table-response.json -w '%{http_code}' \
-                -X POST \
-                http://localhost:8080/v1/clusters/default/databases/gateway_demo/tables \
-                -H 'Content-Type: application/json' \
-                --data @/tmp/create-table.json
-            )"
-
-            if [[ "$http_code" == 2* ]]; then
-              echo "Table created (HTTP $http_code)"
-              cat /tmp/create-table-response.json
-              break
-            fi
-
-            if [[ "$http_code" == "503" ]]; then
-              echo "Gateway not yet connected to Fluss (HTTP 503) - retrying ($i/$MAX_ATTEMPTS)..."
-              sleep "$SLEEP_SECONDS"
-              continue
-            fi
-
-            echo "Create table failed with unexpected HTTP $http_code:"
-            cat /tmp/create-table-response.json
-            exit 1
-          done
-
-          if [[ "$http_code" != 2* ]]; then
-            echo "Gateway never became ready to reach Fluss after $((MAX_ATTEMPTS * SLEEP_SECONDS))s"
-            exit 1
-          fi
+          /tmp/gateway_request.sh POST \
+            http://localhost:8080/v1/clusters/default/databases/gateway_demo/tables \
+            /tmp/create-table.json
 
       # ------------------------------------------------------------
       # Write records through Gateway.
@@ -483,41 +486,13 @@ jobs:
           }
           JSON
 
-          MAX_ATTEMPTS=30
-          SLEEP_SECONDS=3
+          response="$(
+            /tmp/gateway_request.sh POST \
+              http://localhost:8080/v1/clusters/default/databases/gateway_demo/tables/orders/records \
+              /tmp/write-records.json
+          )"
 
-          for i in $(seq 1 "$MAX_ATTEMPTS"); do
-            http_code="$(
-              curl -sS -o /tmp/write-records-response.json -w '%{http_code}' \
-                -X POST \
-                http://localhost:8080/v1/clusters/default/databases/gateway_demo/tables/orders/records \
-                -H 'Content-Type: application/json' \
-                --data @/tmp/write-records.json
-            )"
-
-            if [[ "$http_code" == 2* ]]; then
-              echo "Records written (HTTP $http_code)"
-              cat /tmp/write-records-response.json
-              break
-            fi
-
-            if [[ "$http_code" == "503" ]]; then
-              echo "Gateway not yet connected to Fluss (HTTP 503) - retrying ($i/$MAX_ATTEMPTS)..."
-              sleep "$SLEEP_SECONDS"
-              continue
-            fi
-
-            echo "Write records failed with unexpected HTTP $http_code:"
-            cat /tmp/write-records-response.json
-            exit 1
-          done
-
-          if [[ "$http_code" != 2* ]]; then
-            echo "Gateway never became ready to reach Fluss after $((MAX_ATTEMPTS * SLEEP_SECONDS))s"
-            exit 1
-          fi
-
-          response="$(cat /tmp/write-records-response.json)"
+          echo "$response"
           echo "$response" | grep -q "upsert"
           echo "$response" | grep -q "order_id"
 
@@ -681,15 +656,12 @@ jobs:
           JSON
 
           response="$(
-            curl -sS --fail-with-body \
-              -X POST \
+            /tmp/gateway_request.sh POST \
               http://localhost:8080/v1/clusters/default/databases/gateway_demo/tables/orders/records \
-              -H 'Content-Type: application/json' \
-              --data @/tmp/write-order-4.json
+              /tmp/write-order-4.json
           )"
 
           echo "$response"
-
           echo "$response" | grep -q "upsert"
           echo "$response" | grep -q "order_id"
 
@@ -815,12 +787,10 @@ jobs:
         run: |
           set -e
 
-          curl -sS --fail-with-body \
-            -X DELETE \
+          /tmp/gateway_request.sh DELETE \
             http://localhost:8080/v1/clusters/default/databases/gateway_demo/tables/orders
 
-          curl -sS --fail-with-body \
-            -X DELETE \
+          /tmp/gateway_request.sh DELETE \
             http://localhost:8080/v1/clusters/default/databases/gateway_demo
 
       # ------------------------------------------------------------
