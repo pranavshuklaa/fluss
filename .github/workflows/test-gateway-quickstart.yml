@@ -3,7 +3,7 @@ name: Test Gateway Lakehouse Quickstart
 on:
   push:
     branches:
-      - test/quickstart
+      - issue-4221-http-gateway-quickstart
   workflow_dispatch:
 
 jobs:
@@ -267,6 +267,33 @@ jobs:
           done
 
           curl -sS --fail-with-body http://localhost:8080/ready
+
+      # ------------------------------------------------------------
+      # Diagnostic: get ground truth from the running Gateway itself
+      # instead of trusting the docs' URL shape a second time. This
+      # step never fails the job (no `set -e`, curls don't use --fail)
+      # so its output is always visible in the logs even if later
+      # steps 404 again.
+      # ------------------------------------------------------------
+      - name: Inspect Gateway API surface
+        shell: bash
+        run: |
+          echo "---- Gateway OpenAPI spec (ground truth for actual routes) ----"
+          curl -sS http://localhost:8080/v1/openapi.json \
+            | (command -v jq >/dev/null 2>&1 && jq . || cat)
+
+          echo ""
+          echo "---- Gateway container logs (startup / cluster registration) ----"
+          docker compose \
+            -f /tmp/gateway-lakehouse-compose.yaml \
+            logs --tail=150 gateway
+
+          echo ""
+          echo "---- Raw response for POST /v1/clusters/default/databases (diagnostic only) ----"
+          curl -sS -i -X POST \
+            -H 'Content-Type: application/json' \
+            http://localhost:8080/v1/clusters/default/databases \
+            -d '{"database": "gateway_demo_probe"}' || true
 
       # ------------------------------------------------------------
       # Download Paimon S3 bundle into the SQL client container.
@@ -584,3 +611,193 @@ jobs:
             curl -sS --fail-with-body \
               -X POST \
               http://localhost:8080/v1/clusters/default/databases/gateway_demo/tables/orders/records \
+              -H 'Content-Type: application/json' \
+              --data @/tmp/write-order-4.json
+          )"
+
+          echo "$response"
+
+          echo "$response" | grep -q "upsert"
+          echo "$response" | grep -q "order_id"
+
+      # ------------------------------------------------------------
+      # Union Read should see the hot record before lake tiering.
+      # ------------------------------------------------------------
+      - name: Validate Union Read sees fresh Gateway write
+        shell: bash
+        run: |
+          set -e
+
+          for i in {1..30}; do
+            output="$(
+              docker compose \
+                -f /tmp/gateway-lakehouse-compose.yaml \
+                run --rm -T sql-client \
+                bash -lc '
+                  cp /tmp/paimon-s3.jar /opt/flink/lib/paimon-s3.jar
+
+                  /opt/flink/bin/sql-client.sh <<'"'"'SQL'"'"'
+                  USE CATALOG fluss_catalog;
+                  USE gateway_demo;
+                  SET '"'"'execution.runtime-mode'"'"'='"'"'batch'"'"';
+
+                  SELECT COUNT(*) AS union_count
+                  FROM orders;
+
+                  SELECT *
+                  FROM orders
+                  WHERE order_id = 4;
+                  SQL
+                '
+            )" || true
+
+            echo "$output"
+
+            if echo "$output" | grep -q "4"; then
+              echo "Union Read sees order 4"
+              break
+            fi
+
+            echo "Waiting for fresh Union Read result... ($i/30)"
+            sleep 3
+          done
+
+      # ------------------------------------------------------------
+      # Wait until the fresh record reaches the lake too.
+      # ------------------------------------------------------------
+      - name: Validate fresh record is eventually tiered
+        shell: bash
+        run: |
+          set -e
+
+          for i in {1..60}; do
+            output="$(
+              docker compose \
+                -f /tmp/gateway-lakehouse-compose.yaml \
+                run --rm -T sql-client \
+                bash -lc '
+                  cp /tmp/paimon-s3.jar /opt/flink/lib/paimon-s3.jar
+
+                  /opt/flink/bin/sql-client.sh <<'"'"'SQL'"'"'
+                  USE CATALOG fluss_catalog;
+                  USE gateway_demo;
+                  SET '"'"'execution.runtime-mode'"'"'='"'"'batch'"'"';
+
+                  SELECT COUNT(*) AS lake_count
+                  FROM orders$lake;
+                  SQL
+                '
+            )" || true
+
+            echo "$output"
+
+            if echo "$output" | grep -q "4"; then
+              echo "Four records are now tiered into the lake"
+              break
+            fi
+
+            echo "Waiting for lake tiering... ($i/60)"
+            sleep 5
+          done
+
+      # ------------------------------------------------------------
+      # Final validation.
+      # ------------------------------------------------------------
+      - name: Final end-to-end validation
+        shell: bash
+        run: |
+          set -e
+
+          docker compose \
+            -f /tmp/gateway-lakehouse-compose.yaml \
+            run --rm -T sql-client \
+            bash -lc '
+              cp /tmp/paimon-s3.jar /opt/flink/lib/paimon-s3.jar
+
+              /opt/flink/bin/sql-client.sh <<'"'"'SQL'"'"'
+              USE CATALOG fluss_catalog;
+              USE gateway_demo;
+              SET '"'"'execution.runtime-mode'"'"'='"'"'batch'"'"';
+
+              SELECT COUNT(*) AS snapshot_count
+              FROM orders$lake$snapshots;
+
+              SELECT COUNT(*) AS lake_count
+              FROM orders$lake;
+
+              SELECT COUNT(*) AS union_count
+              FROM orders;
+
+              SELECT *
+              FROM orders
+              ORDER BY order_id;
+              SQL
+            '
+
+      # ------------------------------------------------------------
+      # Verify Gateway cleanup.
+      # ------------------------------------------------------------
+      - name: Cleanup through Gateway
+        shell: bash
+        run: |
+          set -e
+
+          curl -sS --fail-with-body \
+            -X DELETE \
+            http://localhost:8080/v1/clusters/default/databases/gateway_demo/tables/orders
+
+          curl -sS --fail-with-body \
+            -X DELETE \
+            http://localhost:8080/v1/clusters/default/databases/gateway_demo
+
+      # ------------------------------------------------------------
+      # Always collect diagnostics on failure.
+      # ------------------------------------------------------------
+      - name: Collect diagnostics
+        if: failure()
+        shell: bash
+        run: |
+          echo "================ docker compose ps ================"
+          docker compose \
+            -f /tmp/gateway-lakehouse-compose.yaml \
+            ps || true
+
+          echo "================ coordinator logs ================"
+          docker compose \
+            -f /tmp/gateway-lakehouse-compose.yaml \
+            logs --tail=200 coordinator-server || true
+
+          echo "================ tablet logs ================"
+          docker compose \
+            -f /tmp/gateway-lakehouse-compose.yaml \
+            logs --tail=200 tablet-server || true
+
+          echo "================ gateway logs ================"
+          docker compose \
+            -f /tmp/gateway-lakehouse-compose.yaml \
+            logs --tail=300 gateway || true
+
+          echo "================ jobmanager logs ================"
+          docker compose \
+            -f /tmp/gateway-lakehouse-compose.yaml \
+            logs --tail=300 jobmanager || true
+
+          echo "================ taskmanager logs ================"
+          docker compose \
+            -f /tmp/gateway-lakehouse-compose.yaml \
+            logs --tail=300 taskmanager || true
+
+          echo "================ rustfs logs ================"
+          docker compose \
+            -f /tmp/gateway-lakehouse-compose.yaml \
+            logs --tail=200 rustfs || true
+
+      # ------------------------------------------------------------
+      # Always tear down containers/volumes.
+      # ------------------------------------------------------------
+      - name: Tear down Compose stack
+        if: always()
+        run: |
+          docker compose \
+            -f /tmp/gateway-lakehouse-compose.yaml \
+            down -v --remove-orphans
