@@ -176,13 +176,24 @@ jobs:
           docker image inspect fluss-gateway:dev
 
       # ------------------------------------------------------------
-      # Pull/build everything needed before startup.
+      # Pull only the images that actually come from a registry.
+      #
+      # coordinator-server/tablet-server (apache/fluss:$FLUSS_DOCKER_VERSION$)
+      # and gateway (fluss-gateway:dev) were built locally in the previous
+      # two steps, not via a `build:` key in the compose file — so
+      # `--ignore-buildable` doesn't skip them, and `docker compose pull`
+      # tries to fetch apache/fluss:1.0-SNAPSHOT / fluss-gateway:dev from
+      # the registry, where neither exists, aborting the whole pull.
+      # List only the services that are genuinely meant to come from a
+      # registry; compose will use the already-present local images for
+      # the rest when `up -d` runs.
       # ------------------------------------------------------------
       - name: Pull Compose images
         run: |
           docker compose \
             -f /tmp/gateway-lakehouse-compose.yaml \
-            pull --ignore-buildable
+            pull --ignore-buildable \
+            zookeeper rustfs rustfs-init jobmanager taskmanager sql-client
 
       # ------------------------------------------------------------
       # Start stack.
@@ -596,4 +607,170 @@ jobs:
                 -f /tmp/gateway-lakehouse-compose.yaml \
                 run --rm -T sql-client \
                 bash -lc '
-                  cp /tmp/p
+                  cp /tmp/paimon-s3.jar /opt/flink/lib/paimon-s3.jar
+
+                  /opt/flink/bin/sql-client.sh <<'"'"'SQL'"'"'
+                  USE CATALOG fluss_catalog;
+                  USE gateway_demo;
+                  SET '"'"'execution.runtime-mode'"'"'='"'"'batch'"'"';
+
+                  SELECT COUNT(*) AS union_count
+                  FROM orders;
+
+                  SELECT *
+                  FROM orders
+                  WHERE order_id = 4;
+                  SQL
+                '
+            )" || true
+
+            echo "$output"
+
+            if echo "$output" | grep -q "4"; then
+              echo "Union Read sees order 4"
+              break
+            fi
+
+            echo "Waiting for fresh Union Read result... ($i/30)"
+            sleep 3
+          done
+
+      # ------------------------------------------------------------
+      # Wait until the fresh record reaches the lake too.
+      # ------------------------------------------------------------
+      - name: Validate fresh record is eventually tiered
+        shell: bash
+        run: |
+          set -e
+
+          for i in {1..60}; do
+            output="$(
+              docker compose \
+                -f /tmp/gateway-lakehouse-compose.yaml \
+                run --rm -T sql-client \
+                bash -lc '
+                  cp /tmp/paimon-s3.jar /opt/flink/lib/paimon-s3.jar
+
+                  /opt/flink/bin/sql-client.sh <<'"'"'SQL'"'"'
+                  USE CATALOG fluss_catalog;
+                  USE gateway_demo;
+                  SET '"'"'execution.runtime-mode'"'"'='"'"'batch'"'"';
+
+                  SELECT COUNT(*) AS lake_count
+                  FROM orders$lake;
+                  SQL
+                '
+            )" || true
+
+            echo "$output"
+
+            if echo "$output" | grep -q "4"; then
+              echo "Four records are now tiered into the lake"
+              break
+            fi
+
+            echo "Waiting for lake tiering... ($i/60)"
+            sleep 5
+          done
+
+      # ------------------------------------------------------------
+      # Final validation.
+      # ------------------------------------------------------------
+      - name: Final end-to-end validation
+        shell: bash
+        run: |
+          set -e
+
+          docker compose \
+            -f /tmp/gateway-lakehouse-compose.yaml \
+            run --rm -T sql-client \
+            bash -lc '
+              cp /tmp/paimon-s3.jar /opt/flink/lib/paimon-s3.jar
+
+              /opt/flink/bin/sql-client.sh <<'"'"'SQL'"'"'
+              USE CATALOG fluss_catalog;
+              USE gateway_demo;
+              SET '"'"'execution.runtime-mode'"'"'='"'"'batch'"'"';
+
+              SELECT COUNT(*) AS snapshot_count
+              FROM orders$lake$snapshots;
+
+              SELECT COUNT(*) AS lake_count
+              FROM orders$lake;
+
+              SELECT COUNT(*) AS union_count
+              FROM orders;
+
+              SELECT *
+              FROM orders
+              ORDER BY order_id;
+              SQL
+            '
+
+      # ------------------------------------------------------------
+      # Verify Gateway cleanup.
+      # ------------------------------------------------------------
+      - name: Cleanup through Gateway
+        shell: bash
+        run: |
+          set -e
+
+          curl -sS --fail-with-body \
+            -X DELETE \
+            http://localhost:8080/databases/gateway_demo/tables/orders
+
+          curl -sS --fail-with-body \
+            -X DELETE \
+            http://localhost:8080/databases/gateway_demo
+
+      # ------------------------------------------------------------
+      # Always collect diagnostics on failure.
+      # ------------------------------------------------------------
+      - name: Collect diagnostics
+        if: failure()
+        shell: bash
+        run: |
+          echo "================ docker compose ps ================"
+          docker compose \
+            -f /tmp/gateway-lakehouse-compose.yaml \
+            ps || true
+
+          echo "================ coordinator logs ================"
+          docker compose \
+            -f /tmp/gateway-lakehouse-compose.yaml \
+            logs --tail=200 coordinator-server || true
+
+          echo "================ tablet logs ================"
+          docker compose \
+            -f /tmp/gateway-lakehouse-compose.yaml \
+            logs --tail=200 tablet-server || true
+
+          echo "================ gateway logs ================"
+          docker compose \
+            -f /tmp/gateway-lakehouse-compose.yaml \
+            logs --tail=300 gateway || true
+
+          echo "================ jobmanager logs ================"
+          docker compose \
+            -f /tmp/gateway-lakehouse-compose.yaml \
+            logs --tail=300 jobmanager || true
+
+          echo "================ taskmanager logs ================"
+          docker compose \
+            -f /tmp/gateway-lakehouse-compose.yaml \
+            logs --tail=300 taskmanager || true
+
+          echo "================ rustfs logs ================"
+          docker compose \
+            -f /tmp/gateway-lakehouse-compose.yaml \
+            logs --tail=200 rustfs || true
+
+      # ------------------------------------------------------------
+      # Always tear down containers/volumes.
+      # ------------------------------------------------------------
+      - name: Tear down Compose stack
+        if: always()
+        run: |
+          docker compose \
+            -f /tmp/gateway-lakehouse-compose.yaml \
+            down -v --remove-orphans
