@@ -315,19 +315,43 @@ jobs:
       - name: Create database
         shell: bash
         run: |
-          set -e
+          # /ready (checked in the previous step) doesn't verify Fluss
+          # connectivity - the Gateway can return 503 for a while after
+          # startup while it's still connecting to coordinator-server.
+          # Retry specifically on 503 rather than treating it as fatal.
+          MAX_ATTEMPTS=30
+          SLEEP_SECONDS=3
 
-          response="$(
-            curl -sS --fail-with-body \
-              -X POST \
-              http://localhost:8080/v1/clusters/default/databases \
-              -H 'Content-Type: application/json' \
-              -d '{
-                "database": "gateway_demo"
-              }'
-          )"
+          for i in $(seq 1 "$MAX_ATTEMPTS"); do
+            http_code="$(
+              curl -sS -o /tmp/create-db-response.json -w '%{http_code}' \
+                -X POST \
+                http://localhost:8080/v1/clusters/default/databases \
+                -H 'Content-Type: application/json' \
+                -d '{"database": "gateway_demo"}'
+            )"
 
-          echo "$response"
+            if [[ "$http_code" == 2* ]]; then
+              echo "Database created (HTTP $http_code)"
+              cat /tmp/create-db-response.json
+              break
+            fi
+
+            if [[ "$http_code" == "503" ]]; then
+              echo "Gateway not yet connected to Fluss (HTTP 503) - retrying ($i/$MAX_ATTEMPTS)..."
+              sleep "$SLEEP_SECONDS"
+              continue
+            fi
+
+            echo "Create database failed with unexpected HTTP $http_code:"
+            cat /tmp/create-db-response.json
+            exit 1
+          done
+
+          if [[ "$http_code" != 2* ]]; then
+            echo "Gateway never became ready to reach Fluss after $((MAX_ATTEMPTS * SLEEP_SECONDS))s"
+            exit 1
+          fi
 
       # ------------------------------------------------------------
       # Create lake-enabled table through Gateway REST API.
@@ -386,15 +410,39 @@ jobs:
           }
           JSON
 
-          response="$(
-            curl -sS --fail-with-body \
-              -X POST \
-              http://localhost:8080/v1/clusters/default/databases/gateway_demo/tables \
-              -H 'Content-Type: application/json' \
-              --data @/tmp/create-table.json
-          )"
+          MAX_ATTEMPTS=30
+          SLEEP_SECONDS=3
 
-          echo "$response"
+          for i in $(seq 1 "$MAX_ATTEMPTS"); do
+            http_code="$(
+              curl -sS -o /tmp/create-table-response.json -w '%{http_code}' \
+                -X POST \
+                http://localhost:8080/v1/clusters/default/databases/gateway_demo/tables \
+                -H 'Content-Type: application/json' \
+                --data @/tmp/create-table.json
+            )"
+
+            if [[ "$http_code" == 2* ]]; then
+              echo "Table created (HTTP $http_code)"
+              cat /tmp/create-table-response.json
+              break
+            fi
+
+            if [[ "$http_code" == "503" ]]; then
+              echo "Gateway not yet connected to Fluss (HTTP 503) - retrying ($i/$MAX_ATTEMPTS)..."
+              sleep "$SLEEP_SECONDS"
+              continue
+            fi
+
+            echo "Create table failed with unexpected HTTP $http_code:"
+            cat /tmp/create-table-response.json
+            exit 1
+          done
+
+          if [[ "$http_code" != 2* ]]; then
+            echo "Gateway never became ready to reach Fluss after $((MAX_ATTEMPTS * SLEEP_SECONDS))s"
+            exit 1
+          fi
 
       # ------------------------------------------------------------
       # Write records through Gateway.
@@ -435,16 +483,41 @@ jobs:
           }
           JSON
 
-          response="$(
-            curl -sS --fail-with-body \
-              -X POST \
-              http://localhost:8080/v1/clusters/default/databases/gateway_demo/tables/orders/records \
-              -H 'Content-Type: application/json' \
-              --data @/tmp/write-records.json
-          )"
+          MAX_ATTEMPTS=30
+          SLEEP_SECONDS=3
 
-          echo "$response"
+          for i in $(seq 1 "$MAX_ATTEMPTS"); do
+            http_code="$(
+              curl -sS -o /tmp/write-records-response.json -w '%{http_code}' \
+                -X POST \
+                http://localhost:8080/v1/clusters/default/databases/gateway_demo/tables/orders/records \
+                -H 'Content-Type: application/json' \
+                --data @/tmp/write-records.json
+            )"
 
+            if [[ "$http_code" == 2* ]]; then
+              echo "Records written (HTTP $http_code)"
+              cat /tmp/write-records-response.json
+              break
+            fi
+
+            if [[ "$http_code" == "503" ]]; then
+              echo "Gateway not yet connected to Fluss (HTTP 503) - retrying ($i/$MAX_ATTEMPTS)..."
+              sleep "$SLEEP_SECONDS"
+              continue
+            fi
+
+            echo "Write records failed with unexpected HTTP $http_code:"
+            cat /tmp/write-records-response.json
+            exit 1
+          done
+
+          if [[ "$http_code" != 2* ]]; then
+            echo "Gateway never became ready to reach Fluss after $((MAX_ATTEMPTS * SLEEP_SECONDS))s"
+            exit 1
+          fi
+
+          response="$(cat /tmp/write-records-response.json)"
           echo "$response" | grep -q "upsert"
           echo "$response" | grep -q "order_id"
 
