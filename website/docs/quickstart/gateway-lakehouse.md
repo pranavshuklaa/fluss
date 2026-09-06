@@ -1,6 +1,6 @@
 ---
 title: Real-Time Lakehouse via the HTTP Gateway
-sidebar_position: 3
+sidebar_position: 4
 ---
 
 This guide walks through the same real-time lakehouse pattern as the
@@ -11,10 +11,17 @@ REST API instead of Flink SQL. You'll create a datalake-enabled table with
 Lakehouse Tiering Service and query the unified real-time + historical data
 (Union Read).
 
-:::caution Preview
-Fluss Gateway is introduced as a preview in Fluss 1.0. Its API and
-configuration may change in later releases. The Gateway does not yet
-support reading records — this guide reads data back through Flink SQL.
+:::caution Developer Preview - Fluss 1.0 (unreleased)
+Fluss Gateway is a developer preview introduced in Fluss 1.0, which has not
+yet been released. No pre-built Docker Hub image is available yet, this guide
+requires you to **build the Gateway image from the Fluss source repository**
+(see [Build the Gateway image](#build-the-gateway-image) below). 
+If you are not comfortable building from source, check back once Fluss 1.0
+ships with a published 'apache/fluss-gateway' image.
+
+The Gateway API and configuration may change before the final release. 
+The Gateway does not yet support reading records - this guide reads data 
+back through Flink SQL.
 :::
 
 ## Environment Setup
@@ -31,6 +38,12 @@ We encourage you to use a recent version of Docker and [Compose v2](https://docs
 :::
 
 ### Build the Gateway image
+
+:::note Prerequisite: Fluss source repository 
+This step requires the [Fluss source repository] (https://github.com/apache/fluss)
+checked out locally. Unlike other quickstarts, no pre-built Gateway image is 
+published yet - the image is built from source using the script below.
+:::
 
 The Gateway isn't published as a Docker Hub image yet, so this guide builds
 it from source. Run this from the root of your Fluss source checkout (the
@@ -450,8 +463,10 @@ processed it, subject to the configured `table.datalake.freshness`.
 ### Quitting SQL Client
 
 ```sql title="Flink SQL"
-quit;
+exit;
 ```
+After finishing the tutorial, run `exit` to exit the Flink SQL CLI
+container.
 
 ## Preview limitations
 
