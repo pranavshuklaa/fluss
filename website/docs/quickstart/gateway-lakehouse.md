@@ -39,17 +39,13 @@ We encourage you to use a recent version of Docker and [Compose v2](https://docs
 
 ### Build the Gateway image
 
-:::note Prerequisite: Fluss source repository 
-This step requires the [Fluss source repository] (https://github.com/apache/fluss)
-checked out locally. Unlike other quickstarts, no pre-built Gateway image is 
-published yet - the image is built from source using the script below.
+:::note fluss v1.0 developer preview 
+This guide covers a feature shipping in the upcoming fluss 1.0 release.
+A pre-built Docker Hub image will be available at GA - until then,
+building it locally takes one extra step: run the script below from the
+root of your [Fluss source repository] (https://github.com/apache/fluss)
 :::
-
-The Gateway isn't published as a Docker Hub image yet, so this guide builds
-it from source. Run this from the root of your Fluss source checkout (the
-script resolves the repository root itself, so you don't need to `cd` into
-`docker/fluss-gateway` first):
-
+Run this from the root of your Fluss source checkout:
 ```shell
 docker/fluss-gateway/build.sh
 ```
