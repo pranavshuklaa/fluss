@@ -124,20 +124,18 @@ jobs:
       # Dockerfile expects, without depending on the repository-wide
       # build-target symlink.
       # ------------------------------------------------------------
-      - name: Build Fluss distribution
-        shell: bash
+      - name: Build Fluss artifacts
         run: |
-          set -euo pipefail
-
           ./mvnw clean package \
-            -pl fluss-dist \
+            -pl fluss-dist,fluss-flink/fluss-flink-tiering \
             -am \
             -DskipTests \
             -DskipITs \
             -Dmaven.test.skip=true \
             -T 1C
-
+      
           test -f "fluss-dist/target/fluss-${{ steps.versions.outputs.fluss_version }}-bin.tgz"
+          test -d fluss-flink/fluss-flink-tiering/target
 
       - name: Prepare Fluss Docker build context
         shell: bash
