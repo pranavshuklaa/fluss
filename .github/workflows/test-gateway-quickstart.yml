@@ -3,17 +3,25 @@ name: Test Gateway Lakehouse Quickstart
 on:
   push:
     branches:
-      - test/quickstart
+      - issue-4221-http-gateway-quickstart
   workflow_dispatch:
 
 jobs:
   gateway-lakehouse-e2e:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 11
+        uses: actions/setup-java@v5
+        with:
+          java-version: "11"
+          distribution: temurin
 
       - name: Show versions
         run: |
@@ -28,131 +36,135 @@ jobs:
         id: versions
         shell: bash
         run: |
+          set -euo pipefail
+
           python3 - <<'PY'
           import json
           import os
           from pathlib import Path
 
           data = json.loads(Path("website/fluss-versions.json").read_text())
-          next_version = next(
-              v for v in data if v["versionName"] == "next"
-          )
+          next_version = next(v for v in data if v["versionName"] == "next")
 
           fluss_version = next_version["fullVersion"]
           fluss_docker_version = next_version["dockerVersion"]
           paimon_version = next_version["paimonVersion"]
-          flink_docker_version = "1.20-0.9.1-incubating"
+          # The 1.0 development quickstart image is built locally because
+          # the unreleased image is not expected to be available on Docker Hub.
+          flink_docker_version = "1.20-1.0-SNAPSHOT"
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"fluss_version={fluss_version}\n")
+              f.write(f"fluss_docker_version={fluss_docker_version}\n")
+              f.write(f"paimon_version={paimon_version}\n")
+              f.write(f"flink_docker_version={flink_docker_version}\n")
 
           print(f"FLUSS_VERSION={fluss_version}")
           print(f"FLUSS_DOCKER_VERSION={fluss_docker_version}")
           print(f"PAIMON_VERSION={paimon_version}")
           print(f"FLINK_DOCKER_VERSION={flink_docker_version}")
-
-          output_file = os.environ["GITHUB_OUTPUT"]
-
-          with open(output_file, "a") as f:
-              f.write(f"fluss_version={fluss_version}\n")
-              f.write(f"fluss_docker_version={fluss_docker_version}\n")
-              f.write(f"paimon_version={paimon_version}\n")
-              f.write(f"flink_docker_version={flink_docker_version}\n")
           PY
 
       # ------------------------------------------------------------
-      # Extract the Docker Compose example from the quickstart and
-      # substitute the documented version placeholders.
+      # Extract the Compose example directly from the quickstart so the
+      # test cannot drift from the documented Compose setup.
       # ------------------------------------------------------------
       - name: Prepare Compose file from documentation
         shell: bash
+        env:
+          FLUSS_VERSION: ${{ steps.versions.outputs.fluss_version }}
+          FLUSS_DOCKER_VERSION: ${{ steps.versions.outputs.fluss_docker_version }}
+          PAIMON_VERSION: ${{ steps.versions.outputs.paimon_version }}
+          FLINK_DOCKER_VERSION: ${{ steps.versions.outputs.flink_docker_version }}
         run: |
+          set -euo pipefail
+
+          mkdir -p /tmp/lib
+
+          curl -fL --retry 3 --retry-delay 2 \
+            "https://repo.maven.apache.org/maven2/org/apache/paimon/paimon-s3/${PAIMON_VERSION}/paimon-s3-${PAIMON_VERSION}.jar" \
+            -o "/tmp/lib/paimon-s3-${PAIMON_VERSION}.jar"
+          test -s "/tmp/lib/paimon-s3-${PAIMON_VERSION}.jar"
+
           python3 - <<'PY'
+          import os
           import re
           from pathlib import Path
-          import json
 
           md = Path("website/docs/quickstart/gateway-lakehouse.md").read_text()
-
           blocks = re.findall(r"```yaml\s*\n(.*?)```", md, re.S)
           if not blocks:
               raise SystemExit("No YAML fenced block found in quickstart")
 
           compose = blocks[0]
-
-          versions = {
-              "$FLUSS_VERSION$": "${{ steps.versions.outputs.fluss_version }}",
-              "$FLUSS_DOCKER_VERSION$": "${{ steps.versions.outputs.fluss_docker_version }}",
-              "$PAIMON_VERSION$": "${{ steps.versions.outputs.paimon_version }}",
-              "$FLUSS_QUICKSTART_FLINK_DOCKER_VERSION$":
-                  "${{ steps.versions.outputs.flink_docker_version }}",
+          substitutions = {
+              "$FLUSS_VERSION$": os.environ["FLUSS_VERSION"],
+              "$FLUSS_DOCKER_VERSION$": os.environ["FLUSS_DOCKER_VERSION"],
+              "$PAIMON_VERSION$": os.environ["PAIMON_VERSION"],
+              "$FLUSS_QUICKSTART_FLINK_DOCKER_VERSION$": os.environ["FLINK_DOCKER_VERSION"],
           }
-
-          for old, new in versions.items():
+          for old, new in substitutions.items():
               compose = compose.replace(old, new)
+
+          unresolved = re.findall(r"\$[A-Z][A-Z0-9_]*\$", compose)
+          if unresolved:
+              raise SystemExit(f"Unresolved placeholders: {unresolved}")
 
           Path("/tmp/gateway-lakehouse-compose.yaml").write_text(compose)
           print(compose)
           PY
 
-          echo "---- docker compose config ----"
           docker compose \
             -f /tmp/gateway-lakehouse-compose.yaml \
             config
 
       # ------------------------------------------------------------
-      # Build Apache Fluss from source.
-      #
-      # docker/fluss/Dockerfile explicitly COPYs build-target/,
-      # which is generated by the Maven build.
+      # Build only the Fluss distribution needed by the server image.
+      # The distribution tarball contains the same /opt/fluss layout the
+      # Dockerfile expects, without depending on the repository-wide
+      # build-target symlink.
       # ------------------------------------------------------------
       - name: Build Fluss distribution
+        shell: bash
         run: |
-          ./mvnw clean package -DskipTests -T 1C
+          set -euo pipefail
 
-          test -d build-target
-          test -d fluss-dist/target
+          ./mvnw clean package \
+            -pl fluss-dist \
+            -am \
+            -DskipTests \
+            -DskipITs \
+            -Dmaven.test.skip=true \
+            -T 1C
 
-          echo "---- build-target link check ----"
-          # build-target is typically a symlink into fluss-dist/target/... —
-          # report that explicitly so a dangling-symlink bug (see the next
-          # step) is obvious from this log instead of surfacing three steps
-          # downstream as a BuildKit "not found" error.
-          if [ -L build-target ]; then
-            echo "build-target is a symlink -> $(readlink -f build-target)"
-          else
-            echo "build-target is a real directory"
-          fi
-
-          echo "---- Fluss distribution ----"
-          find fluss-dist/target -maxdepth 1 -type f -print
-
-          echo "---- build-target ----"
-          find build-target -maxdepth 2 -type f | head -100
+          test -f "fluss-dist/target/fluss-${{ steps.versions.outputs.fluss_version }}-bin.tgz"
 
       - name: Prepare Fluss Docker build context
+        shell: bash
         run: |
+          set -euo pipefail
+
           rm -rf /tmp/fluss-docker-context
-          mkdir -p /tmp/fluss-docker-context
+          mkdir -p /tmp/fluss-docker-context/build-target
 
-          cp -a docker/fluss/Dockerfile /tmp/fluss-docker-context/
-          cp -a docker/fluss/docker-entrypoint.sh /tmp/fluss-docker-context/
-          # -L dereferences the build-target symlink so BuildKit gets a real
-          # directory tree in its build context instead of a dangling link
-          # (cp -a alone copies the symlink itself, which -- once outside
-          # the original repo layout -- points nowhere and makes the later
-          # `docker build` fail with "/build-target: not found").
-          cp -aL build-target /tmp/fluss-docker-context/build-target
+          cp docker/fluss/Dockerfile /tmp/fluss-docker-context/
+          cp docker/fluss/docker-entrypoint.sh /tmp/fluss-docker-context/
 
-          echo "---- Docker context ----"
-          du -sh /tmp/fluss-docker-context
-          test -d /tmp/fluss-docker-context/build-target
+          tar -xzf \
+            "fluss-dist/target/fluss-${{ steps.versions.outputs.fluss_version }}-bin.tgz" \
+            -C /tmp/fluss-docker-context/build-target \
+            --strip-components=1
+
           test -f /tmp/fluss-docker-context/Dockerfile
           test -f /tmp/fluss-docker-context/docker-entrypoint.sh
-          # Fail loudly here rather than inside `docker build` if the
-          # dereferenced copy is somehow empty.
-          [ -n "$(find /tmp/fluss-docker-context/build-target -maxdepth 1 -mindepth 1)" ] \
-            || { echo "build-target copy is empty after dereferencing" >&2; exit 1; }
+          test -d /tmp/fluss-docker-context/build-target/bin
+          test -d /tmp/fluss-docker-context/build-target/lib
 
       - name: Build Fluss Docker image
+        shell: bash
         run: |
+          set -euo pipefail
+
           docker build \
             -t apache/fluss:${{ steps.versions.outputs.fluss_docker_version }} \
             /tmp/fluss-docker-context
@@ -161,31 +173,64 @@ jobs:
             apache/fluss:${{ steps.versions.outputs.fluss_docker_version }}
 
       # ------------------------------------------------------------
-      # Build Gateway image.
+      # Build the local Gateway image referenced by the documentation.
       # ------------------------------------------------------------
       - name: Build Gateway Docker image
+        shell: bash
         run: |
-          docker/fluss-gateway/build.sh
+          set -euo pipefail
 
+          docker/fluss-gateway/build.sh
           docker image inspect fluss-gateway:dev
 
       # ------------------------------------------------------------
-      # Pull only the images that actually come from a registry.
-      # coordinator-server/tablet-server (apache/fluss:<version>) and
-      # gateway (fluss-gateway:dev) were just built locally above, and
-      # neither is published anywhere -- `docker compose pull` on the bare
-      # `image:` reference would otherwise try to fetch them from Docker
-      # Hub, 404, and abort the pull for every other service too.
+      # Build a matching 1.0 development Flink quickstart image locally.
+      # The branch may not yet contain prepare_build.sh, so use the current
+      # main version only as a temporary build helper on the CI runner.
       # ------------------------------------------------------------
-      - name: Pull Compose images
+      - name: Prepare Flink quickstart build
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -f docker/quickstart-flink/prepare_build.sh ]]; then
+            RELEASE_VERSION="${{ steps.versions.outputs.fluss_version }}" \
+              docker/quickstart-flink/prepare_build.sh
+          else
+            git show origin/main:docker/quickstart-flink/prepare_build.sh \
+              > docker/quickstart-flink/prepare_build.sh
+            chmod +x docker/quickstart-flink/prepare_build.sh
+            RELEASE_VERSION="${{ steps.versions.outputs.fluss_version }}" \
+              docker/quickstart-flink/prepare_build.sh
+            rm -f docker/quickstart-flink/prepare_build.sh
+          fi
+
+      - name: Build Flink quickstart Docker image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker buildx build \
+            --load \
+            --platform linux/amd64 \
+            -t apache/fluss-quickstart-flink:${{ steps.versions.outputs.flink_docker_version }} \
+            docker/quickstart-flink
+
+          docker image inspect \
+            apache/fluss-quickstart-flink:${{ steps.versions.outputs.flink_docker_version }}
+
+      # ------------------------------------------------------------
+      # Pull only registry-backed services. Fluss, Gateway and the Flink
+      # quickstart image were built locally above.
+      # ------------------------------------------------------------
+      - name: Pull external Compose images
         run: |
           docker compose \
             -f /tmp/gateway-lakehouse-compose.yaml \
-            pull --ignore-buildable \
-            rustfs rustfs-init zookeeper jobmanager taskmanager sql-client
+            pull rustfs rustfs-init zookeeper
 
       # ------------------------------------------------------------
-      # Start stack.
+      # Start the stack from the Compose block in the documentation.
       # ------------------------------------------------------------
       - name: Start Compose stack
         run: |
@@ -198,244 +243,150 @@ jobs:
             ps
 
       # ------------------------------------------------------------
-      # Wait for the core infrastructure.
+      # Match the documented startup check, but add an explicit timeout.
       # ------------------------------------------------------------
-      - name: Wait for core containers
+      - name: Wait for Gateway and Fluss
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
-          compose() {
-            docker compose \
-              -f /tmp/gateway-lakehouse-compose.yaml \
-              "$@"
-          }
-
-          for i in {1..60}; do
-            if compose ps --status running | grep -q coordinator-server; then
-              echo "Coordinator is running"
-              break
+          for i in {1..90}; do
+            if curl -sS --fail \
+                http://localhost:8080/v1/clusters/default/databases \
+                >/tmp/gateway-databases.json; then
+              echo "Gateway can reach Fluss."
+              cat /tmp/gateway-databases.json
+              exit 0
             fi
 
-            echo "Waiting for coordinator... ($i/60)"
-            sleep 5
-          done
-
-          compose ps
-
-      # ------------------------------------------------------------
-      # Gateway health/readiness.
-      # ------------------------------------------------------------
-      - name: Wait for Gateway
-        shell: bash
-        run: |
-          set -e
-
-          for i in {1..60}; do
-            if curl -sS --fail http://localhost:8080/health >/tmp/gateway-health.json 2>/tmp/gateway-health.err; then
-              echo "Gateway /health is ready"
-              cat /tmp/gateway-health.json
-              break
-            fi
-
-            echo "Waiting for Gateway /health... ($i/60)"
+            echo "Waiting for Gateway/Fluss... ($i/90)"
             sleep 2
           done
 
-          curl -sS --fail-with-body http://localhost:8080/health
-
-          for i in {1..60}; do
-            if curl -sS --fail http://localhost:8080/ready >/tmp/gateway-ready.json 2>/tmp/gateway-ready.err; then
-              echo "Gateway /ready is ready"
-              cat /tmp/gateway-ready.json
-              break
-            fi
-
-            echo "Waiting for Gateway /ready... ($i/60)"
-            sleep 2
-          done
-
-          curl -sS --fail-with-body http://localhost:8080/ready
+          echo "Timed out waiting for Gateway to reach Fluss." >&2
+          docker compose -f /tmp/gateway-lakehouse-compose.yaml ps
+          exit 1
 
       # ------------------------------------------------------------
-      # Download Paimon S3 bundle into the SQL client container.
-      # ------------------------------------------------------------
-      - name: Download Paimon S3 jar
-        shell: bash
-        run: |
-          PAIMON_VERSION="${{ steps.versions.outputs.paimon_version }}"
-
-          curl -fL \
-            "https://repo1.maven.org/maven2/org/apache/paimon/paimon-s3/${PAIMON_VERSION}/paimon-s3-${PAIMON_VERSION}.jar" \
-            -o /tmp/paimon-s3.jar
-
-          test -s /tmp/paimon-s3.jar
-
-      # ------------------------------------------------------------
-      # Shared retry helper for Gateway writes.
-      #
-      # /health and /ready do not verify Fluss connectivity (documented in
-      # website/docs/gateway/index.md), so the Gateway can report "ready"
-      # while it is still retrying its connection to coordinator-server in
-      # the background. Two distinct symptoms of that same underlying race
-      # have been observed against this stack:
-      #
-      #   - HTTP 503, `unavailable` -- the connection to Fluss hasn't been
-      #     established at all yet.
-      #   - HTTP 400, `invalid_argument`, with the message "Fluss rejected
-      #     the request while trying to connect to Fluss" -- seen once the
-      #     TCP connection succeeds but the coordinator hasn't finished its
-      #     own startup (metadata/leader init) and rejects the RPC. This
-      #     code does not match its own OpenAPI spec's documented meaning
-      #     for 400 ("malformed body or invalid definition") given the
-      #     request body is schema-valid, which points to this being a
-      #     generic fallback the Gateway uses for an RPC error it doesn't
-      #     have a more specific mapping for -- not a real client error.
-      #
-      # Retry BOTH signatures with backoff. Anything else fails immediately
-      # with the full response body, so a genuine error is never masked.
+      # Retry helper for the transient startup race between Gateway and
+      # the Fluss coordinator. All non-transient responses fail immediately.
       # ------------------------------------------------------------
       - name: Write Gateway retry helper
         shell: bash
         run: |
-          cat >/tmp/gateway_request.sh <<'SCRIPT'
-          #!/usr/bin/env bash
-          # Usage: gateway_request.sh <METHOD> <URL> [DATA_FILE]
-          # Retries on:
-          #   - HTTP 503 (Fluss unavailable / gateway still starting)
-          #   - HTTP 400 with code=invalid_argument AND a message containing
-          #     "while trying to connect to Fluss" (coordinator not fully up
-          #     yet, mislabeled by the Gateway as a client error)
-          # Fails immediately, printing the full response body, on any other
-          # status or error signature.
           set -euo pipefail
 
-          METHOD="$1"
-          URL="$2"
-          DATA_FILE="${3:-}"
+          cat > /tmp/gateway_request.sh <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
 
-          MAX_ATTEMPTS=30
-          SLEEP_SECONDS=3
-          RESPONSE_FILE="$(mktemp)"
+          method="$1"
+          url="$2"
+          data_file="${3:-}"
+          max_attempts=30
+          sleep_seconds=3
+          response_file="$(mktemp)"
 
-          for i in $(seq 1 "$MAX_ATTEMPTS"); do
-            if [[ -n "$DATA_FILE" ]]; then
-              http_code="$(
-                curl -sS -o "$RESPONSE_FILE" -w '%{http_code}' \
-                  -X "$METHOD" "$URL" \
+          cleanup() { rm -f "$response_file"; }
+          trap cleanup EXIT
+
+          for i in $(seq 1 "$max_attempts"); do
+            if [[ -n "$data_file" ]]; then
+              http_code="$({
+                curl -sS -o "$response_file" -w '%{http_code}' \
+                  -X "$method" \
                   -H 'Content-Type: application/json' \
-                  --data "@${DATA_FILE}"
-              )"
+                  --data "@$data_file" \
+                  "$url"
+              })"
             else
-              http_code="$(
-                curl -sS -o "$RESPONSE_FILE" -w '%{http_code}' -X "$METHOD" "$URL"
-              )"
+              http_code="$({
+                curl -sS -o "$response_file" -w '%{http_code}' \
+                  -X "$method" \
+                  "$url"
+              })"
             fi
 
             if [[ "$http_code" == 2* ]]; then
-              echo "Succeeded (HTTP $http_code)"
-              cat "$RESPONSE_FILE"
-              rm -f "$RESPONSE_FILE"
+              cat "$response_file"
               exit 0
             fi
 
             if [[ "$http_code" == "503" ]]; then
-              echo "Gateway not yet connected to Fluss (HTTP 503) - retrying ($i/$MAX_ATTEMPTS)..."
-              sleep "$SLEEP_SECONDS"
+              echo "Gateway returned HTTP 503; retrying ($i/$max_attempts)..."
+              sleep "$sleep_seconds"
               continue
             fi
 
-            if [[ "$http_code" == "400" ]] \
-                && [[ "$(jq -r '.error.code // empty' "$RESPONSE_FILE" 2>/dev/null)" == "invalid_argument" ]] \
-                && jq -e '.error.message // "" | test("while trying to connect to Fluss")' "$RESPONSE_FILE" >/dev/null 2>&1; then
-              echo "Coordinator not fully initialized yet (HTTP 400, invalid_argument) - retrying ($i/$MAX_ATTEMPTS)..."
-              cat "$RESPONSE_FILE"
-              sleep "$SLEEP_SECONDS"
+            if [[ "$http_code" == "400" ]] && python3 - "$response_file" <<'PY'
+          import json
+          import sys
+
+          try:
+              body = json.loads(open(sys.argv[1]).read())
+          except Exception:
+              raise SystemExit(1)
+
+          error = body.get("error", {})
+          transient = (
+              error.get("code") == "invalid_argument"
+              and "while trying to connect to Fluss" in error.get("message", "")
+          )
+          raise SystemExit(0 if transient else 1)
+          PY
+            then
+              echo "Gateway returned transient Fluss-connection HTTP 400; retrying ($i/$max_attempts)..."
+              cat "$response_file"
+              sleep "$sleep_seconds"
               continue
             fi
 
-            echo "Request failed with unexpected HTTP $http_code:"
-            cat "$RESPONSE_FILE"
-            rm -f "$RESPONSE_FILE"
+            echo "Gateway request failed with HTTP $http_code:" >&2
+            cat "$response_file" >&2
             exit 1
           done
 
-          echo "Gateway never became ready to reach Fluss after $((MAX_ATTEMPTS * SLEEP_SECONDS))s"
-          cat "$RESPONSE_FILE"
-          rm -f "$RESPONSE_FILE"
+          echo "Gateway request timed out after $((max_attempts * sleep_seconds))s." >&2
+          cat "$response_file" >&2
           exit 1
           SCRIPT
 
           chmod +x /tmp/gateway_request.sh
 
       # ------------------------------------------------------------
-      # Create database through Gateway REST API.
+      # Create the database exactly as documented.
       # ------------------------------------------------------------
       - name: Create database
         shell: bash
         run: |
-          set -e
-
           cat >/tmp/create-db.json <<'JSON'
           {
             "database": "gateway_demo"
           }
           JSON
 
-          /tmp/gateway_request.sh POST \
+          /tmp/gateway_request.sh \
+            POST \
             http://localhost:8080/v1/clusters/default/databases \
             /tmp/create-db.json
 
       # ------------------------------------------------------------
-      # Create lake-enabled table through Gateway REST API.
+      # Create the lake-enabled orders table exactly as documented.
       # ------------------------------------------------------------
       - name: Create lake-enabled table
         shell: bash
         run: |
-          set -e
-
           cat >/tmp/create-table.json <<'JSON'
           {
             "table_name": "orders",
             "columns": [
-              {
-                "name": "order_id",
-                "data_type": {
-                  "type": "INTEGER"
-                },
-                "nullable": false
-              },
-              {
-                "name": "customer",
-                "data_type": {
-                  "type": "STRING"
-                },
-                "nullable": true
-              },
-              {
-                "name": "amount_cents",
-                "data_type": {
-                  "type": "BIGINT"
-                },
-                "nullable": true
-              },
-              {
-                "name": "status",
-                "data_type": {
-                  "type": "STRING"
-                },
-                "nullable": true
-              }
+              {"name": "order_id", "data_type": {"type": "INTEGER"}, "nullable": false},
+              {"name": "customer", "data_type": {"type": "STRING"}, "nullable": true},
+              {"name": "amount_cents", "data_type": {"type": "BIGINT"}, "nullable": true},
+              {"name": "status", "data_type": {"type": "STRING"}, "nullable": true}
             ],
-            "primary_key": [
-              "order_id"
-            ],
-            "distribution": {
-              "bucket_count": 1,
-              "bucket_keys": [
-                "order_id"
-              ]
-            },
+            "primary_key": ["order_id"],
+            "distribution": {"bucket_count": 1, "bucket_keys": ["order_id"]},
             "configs": {
               "table.datalake.enabled": "true",
               "table.datalake.freshness": "30s"
@@ -443,94 +394,100 @@ jobs:
           }
           JSON
 
-          /tmp/gateway_request.sh POST \
+          /tmp/gateway_request.sh \
+            POST \
             http://localhost:8080/v1/clusters/default/databases/gateway_demo/tables \
             /tmp/create-table.json
 
       # ------------------------------------------------------------
-      # Write records through Gateway.
+      # Write the three orders from the latest documentation.
       # ------------------------------------------------------------
       - name: Write initial records
         shell: bash
         run: |
-          set -e
-
           cat >/tmp/write-records.json <<'JSON'
           {
             "entries": [
-              {
-                "upsert": {
-                  "order_id": 1,
-                  "customer": "Alice",
-                  "amount_cents": 12500,
-                  "status": "CREATED"
-                }
-              },
-              {
-                "upsert": {
-                  "order_id": 2,
-                  "customer": "Bob",
-                  "amount_cents": 8900,
-                  "status": "PAID"
-                }
-              },
-              {
-                "upsert": {
-                  "order_id": 3,
-                  "customer": "Carol",
-                  "amount_cents": 4200,
-                  "status": "SHIPPED"
-                }
-              }
+              {"id": "order-1", "upsert": {"order_id": 1, "customer": "Alice", "amount_cents": 4599, "status": "placed"}},
+              {"id": "order-2", "upsert": {"order_id": 2, "customer": "Bob", "amount_cents": 12000, "status": "placed"}},
+              {"id": "order-3", "upsert": {"order_id": 3, "customer": "Carol", "amount_cents": 750, "status": "placed"}}
             ]
           }
           JSON
 
-          response="$(
-            /tmp/gateway_request.sh POST \
-              http://localhost:8080/v1/clusters/default/databases/gateway_demo/tables/orders/records \
-              /tmp/write-records.json
-          )"
+          /tmp/gateway_request.sh \
+            POST \
+            http://localhost:8080/v1/clusters/default/databases/gateway_demo/tables/orders/records \
+            /tmp/write-records.json \
+            >/tmp/write-records-response.json
 
-          echo "$response"
-          echo "$response" | grep -q "upsert"
-          echo "$response" | grep -q "order_id"
+          cat /tmp/write-records-response.json
+
+          python3 - <<'PY'
+          import json
+
+          body = json.loads(open("/tmp/write-records-response.json").read())
+          assert body["row_count"] == 3, body
+          assert body["success_count"] == 3, body
+          assert body["error_count"] == 0, body
+          assert len(body["successes"]) == 3, body
+          assert body["failures"] == [], body
+          PY
 
       # ------------------------------------------------------------
-      # Wait for Flink.
+      # Query immediately through Flink Union Read, before tiering starts.
       # ------------------------------------------------------------
-      - name: Wait for Flink
+      - name: Verify immediate Union Read
         shell: bash
         run: |
-          set -e
+          cat >/tmp/query-immediate.sql <<'SQL'
+          CREATE CATALOG fluss_catalog WITH (
+              'type' = 'fluss',
+              'bootstrap.servers' = 'coordinator-server:9123',
+              'paimon.s3.access-key' = 'rustfsadmin',
+              'paimon.s3.secret-key' = 'rustfsadmin'
+          );
 
-          for i in {1..60}; do
-            if docker compose \
-                -f /tmp/gateway-lakehouse-compose.yaml \
-                exec -T jobmanager \
-                /opt/flink/bin/flink list >/tmp/flink-list.out 2>/tmp/flink-list.err; then
-              echo "Flink is ready"
-              cat /tmp/flink-list.out
-              break
-            fi
+          USE CATALOG fluss_catalog;
+          USE gateway_demo;
+          SET 'sql-client.execution.result-mode' = 'tableau';
+          SET 'execution.runtime-mode' = 'batch';
 
-            echo "Waiting for Flink... ($i/60)"
-            sleep 3
-          done
+          SELECT COUNT(*) AS union_count FROM orders;
+          SELECT order_id, customer, amount_cents, status FROM orders ORDER BY order_id;
+          SQL
+
+          docker compose \
+            -f /tmp/gateway-lakehouse-compose.yaml \
+            run --rm -T sql-client \
+            bash -lc '/opt/flink/bin/sql-client.sh < /tmp/query-immediate.sql' \
+            | tee /tmp/immediate-query.out
+
+          grep -Eq '(^|[^0-9])3([^0-9]|$)' /tmp/immediate-query.out
+          grep -q 'Alice' /tmp/immediate-query.out
+          grep -q 'Bob' /tmp/immediate-query.out
+          grep -q 'Carol' /tmp/immediate-query.out
 
       # ------------------------------------------------------------
-      # Start Lakehouse Tiering Service.
+      # Start the Lakehouse Tiering Service exactly as documented.
       # ------------------------------------------------------------
       - name: Start Lakehouse Tiering Service
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
+
+          tiering_jar="/opt/flink/opt/fluss-flink-tiering-${{ steps.versions.outputs.fluss_version }}.jar"
+
+          docker compose \
+            -f /tmp/gateway-lakehouse-compose.yaml \
+            exec -T jobmanager \
+            bash -lc "test -f '${tiering_jar}'"
 
           docker compose \
             -f /tmp/gateway-lakehouse-compose.yaml \
             exec -T jobmanager \
             /opt/flink/bin/flink run -d \
-              /opt/flink/opt/fluss-flink-tiering-${{ steps.versions.outputs.fluss_version }}.jar \
+              "${tiering_jar}" \
               --fluss.bootstrap.servers coordinator-server:9123 \
               --datalake.format paimon \
               --datalake.paimon.metastore filesystem \
@@ -548,249 +505,254 @@ jobs:
             /opt/flink/bin/flink list
 
       # ------------------------------------------------------------
-      # Install Paimon S3 connector in SQL client.
+      # Wait for the first Paimon snapshot and the three lake rows.
       # ------------------------------------------------------------
-      - name: Prepare SQL client
+      - name: Verify initial Paimon tiering
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
-          docker compose \
-            -f /tmp/gateway-lakehouse-compose.yaml \
-            cp /tmp/paimon-s3.jar sql-client:/tmp/paimon-s3.jar
+          cat >/tmp/query-lake-count.sql <<'SQL'
+          CREATE CATALOG fluss_catalog WITH (
+              'type' = 'fluss',
+              'bootstrap.servers' = 'coordinator-server:9123',
+              'paimon.s3.access-key' = 'rustfsadmin',
+              'paimon.s3.secret-key' = 'rustfsadmin'
+          );
 
-      # ------------------------------------------------------------
-      # Helper script for SQL queries.
-      # ------------------------------------------------------------
-      - name: Wait for initial lake snapshot
-        shell: bash
-        run: |
-          set -e
+          USE CATALOG fluss_catalog;
+          USE gateway_demo;
+          SET 'execution.runtime-mode' = 'batch';
+
+          SELECT COUNT(*) AS lake_rows FROM orders$lake;
+          SQL
 
           for i in {1..60}; do
-            output="$(
+            output="$({
               docker compose \
                 -f /tmp/gateway-lakehouse-compose.yaml \
                 run --rm -T sql-client \
-                bash -lc '
-                  cp /tmp/paimon-s3.jar /opt/flink/lib/paimon-s3.jar
-
-                  /opt/flink/bin/sql-client.sh <<'"'"'SQL'"'"'
-                  USE CATALOG fluss_catalog;
-                  USE gateway_demo;
-                  SET '"'"'execution.runtime-mode'"'"'='"'"'batch'"'"';
-
-                  SELECT * FROM orders$lake$snapshots;
-                  SELECT COUNT(*) FROM orders$lake;
-                  SELECT COUNT(*) FROM orders;
-                  SQL
-                '
-            )" || true
+                bash -lc '/opt/flink/bin/sql-client.sh < /tmp/query-lake-count.sql'
+            } 2>&1 || true)"
 
             echo "$output"
-
-            if echo "$output" | grep -qE '3.*3|3[[:space:]]*\|[[:space:]]*3'; then
-              echo "Lake data is visible"
-              break
-            fi
-
-            echo "Waiting for tiering... ($i/60)"
-            sleep 5
-          done
-
-      # ------------------------------------------------------------
-      # Validate snapshot metadata, lake data and Union Read.
-      # ------------------------------------------------------------
-      - name: Validate initial lakehouse state
-        shell: bash
-        run: |
-          set -e
-
-          docker compose \
-            -f /tmp/gateway-lakehouse-compose.yaml \
-            run --rm -T sql-client \
-            bash -lc '
-              cp /tmp/paimon-s3.jar /opt/flink/lib/paimon-s3.jar
-
-              /opt/flink/bin/sql-client.sh <<'"'"'"'"'SQL'"'"'
-              USE CATALOG fluss_catalog;
-              USE gateway_demo;
-              SET '"'"'"'"'execution.runtime-mode'"'"'"'='"'"'"'batch'"'"'"';
-
-              SELECT * FROM orders$lake$snapshots;
-
-              SELECT COUNT(*) AS lake_count
-              FROM orders$lake;
-
-              SELECT COUNT(*) AS union_count
-              FROM orders;
-
-              SELECT *
-              FROM orders
-              ORDER BY order_id;
-
-              SQL
-            '
-
-      # ------------------------------------------------------------
-      # Fresh Gateway write after tiering has begun.
-      # ------------------------------------------------------------
-      - name: Write fresh record through Gateway
-        shell: bash
-        run: |
-          set -e
-
-          cat >/tmp/write-order-4.json <<'JSON'
-          {
-            "entries": [
-              {
-                "upsert": {
-                  "order_id": 4,
-                  "customer": "Dave",
-                  "amount_cents": 7777,
-                  "status": "CREATED"
-                }
-              }
-            ]
-          }
-          JSON
-
-          response="$(
-            /tmp/gateway_request.sh POST \
-              http://localhost:8080/v1/clusters/default/databases/gateway_demo/tables/orders/records \
-              /tmp/write-order-4.json
-          )"
-
-          echo "$response"
-          echo "$response" | grep -q "upsert"
-          echo "$response" | grep -q "order_id"
-
-      # ------------------------------------------------------------
-      # Union Read should see the hot record before lake tiering.
-      # ------------------------------------------------------------
-      - name: Validate Union Read sees fresh Gateway write
-        shell: bash
-        run: |
-          set -e
-
-          for i in {1..30}; do
-            output="$(
-              docker compose \
-                -f /tmp/gateway-lakehouse-compose.yaml \
-                run --rm -T sql-client \
-                bash -lc '
-                  cp /tmp/paimon-s3.jar /opt/flink/lib/paimon-s3.jar
-
-                  /opt/flink/bin/sql-client.sh <<'"'"'SQL'"'"'
-                  USE CATALOG fluss_catalog;
-                  USE gateway_demo;
-                  SET '"'"'execution.runtime-mode'"'"'='"'"'batch'"'"';
-
-                  SELECT COUNT(*) AS union_count
-                  FROM orders;
-
-                  SELECT *
-                  FROM orders
-                  WHERE order_id = 4;
-                  SQL
-                '
-            )" || true
-
-            echo "$output"
-
-            if echo "$output" | grep -q "4"; then
-              echo "Union Read sees order 4"
-              break
-            fi
-
-            echo "Waiting for fresh Union Read result... ($i/30)"
-            sleep 3
-          done
-
-      # ------------------------------------------------------------
-      # Wait until the fresh record reaches the lake too.
-      # ------------------------------------------------------------
-      - name: Validate fresh record is eventually tiered
-        shell: bash
-        run: |
-          set -e
-
-          for i in {1..60}; do
-            output="$(
-              docker compose \
-                -f /tmp/gateway-lakehouse-compose.yaml \
-                run --rm -T sql-client \
-                bash -lc '
-                  cp /tmp/paimon-s3.jar /opt/flink/lib/paimon-s3.jar
-
-                  /opt/flink/bin/sql-client.sh <<'"'"'SQL'"'"'
-                  USE CATALOG fluss_catalog;
-                  USE gateway_demo;
-                  SET '"'"'execution.runtime-mode'"'"'='"'"'batch'"'"';
-
-                  SELECT COUNT(*) AS lake_count
-                  FROM orders$lake;
-                  SQL
-                '
-            )" || true
-
-            echo "$output"
-
-            if echo "$output" | grep -q "4"; then
-              echo "Four records are now tiered into the lake"
-              break
+            if echo "$output" | grep -Eq '(^|[^0-9])3([^0-9]|$)'; then
+              echo "Three records are visible in Paimon."
+              exit 0
             fi
 
             echo "Waiting for lake tiering... ($i/60)"
             sleep 5
           done
 
-      # ------------------------------------------------------------
-      # Final validation.
-      # ------------------------------------------------------------
-      - name: Final end-to-end validation
+          echo "Timed out waiting for three lake rows." >&2
+          exit 1
+
+      - name: Verify Paimon snapshots
         shell: bash
         run: |
-          set -e
+          cat >/tmp/query-snapshots.sql <<'SQL'
+          CREATE CATALOG fluss_catalog WITH (
+              'type' = 'fluss',
+              'bootstrap.servers' = 'coordinator-server:9123',
+              'paimon.s3.access-key' = 'rustfsadmin',
+              'paimon.s3.secret-key' = 'rustfsadmin'
+          );
+
+          USE CATALOG fluss_catalog;
+          USE gateway_demo;
+          SET 'execution.runtime-mode' = 'batch';
+
+          SELECT snapshot_id, total_record_count
+          FROM orders$lake$snapshots
+          ORDER BY snapshot_id;
+          SQL
 
           docker compose \
             -f /tmp/gateway-lakehouse-compose.yaml \
             run --rm -T sql-client \
-            bash -lc '
-              cp /tmp/paimon-s3.jar /opt/flink/lib/paimon-s3.jar
+            bash -lc '/opt/flink/bin/sql-client.sh < /tmp/query-snapshots.sql' \
+            | tee /tmp/snapshots.out
 
-              /opt/flink/bin/sql-client.sh <<'"'"'SQL'"'"'
-              USE CATALOG fluss_catalog;
-              USE gateway_demo;
-              SET '"'"'execution.runtime-mode'"'"'='"'"'batch'"'"';
-
-              SELECT COUNT(*) AS snapshot_count
-              FROM orders$lake$snapshots;
-
-              SELECT COUNT(*) AS lake_count
-              FROM orders$lake;
-
-              SELECT COUNT(*) AS union_count
-              FROM orders;
-
-              SELECT *
-              FROM orders
-              ORDER BY order_id;
-              SQL
-            '
+          grep -Eq '(^|[^0-9])3([^0-9]|$)' /tmp/snapshots.out
 
       # ------------------------------------------------------------
-      # Verify Gateway cleanup.
+      # Write order 4 through Gateway after tiering has begun.
+      # ------------------------------------------------------------
+      - name: Write fresh record through Gateway
+        shell: bash
+        run: |
+          cat >/tmp/write-order-4.json <<'JSON'
+          {
+            "entries": [
+              {
+                "id": "order-4",
+                "upsert": {
+                  "order_id": 4,
+                  "customer": "Dave",
+                  "amount_cents": 2200,
+                  "status": "placed"
+                }
+              }
+            ]
+          }
+          JSON
+
+          /tmp/gateway_request.sh \
+            POST \
+            http://localhost:8080/v1/clusters/default/databases/gateway_demo/tables/orders/records \
+            /tmp/write-order-4.json \
+            >/tmp/write-order-4-response.json
+
+          cat /tmp/write-order-4-response.json
+
+          python3 - <<'PY'
+          import json
+
+          body = json.loads(open("/tmp/write-order-4-response.json").read())
+          assert body["row_count"] == 1, body
+          assert body["success_count"] == 1, body
+          assert body["error_count"] == 0, body
+          assert len(body["successes"]) == 1, body
+          assert body["failures"] == [], body
+          PY
+
+      # ------------------------------------------------------------
+      # Union Read should see order 4 immediately, before lake tiering.
+      # ------------------------------------------------------------
+      - name: Verify Union Read sees fresh Gateway write
+        shell: bash
+        run: |
+          cat >/tmp/query-fresh-union.sql <<'SQL'
+          CREATE CATALOG fluss_catalog WITH (
+              'type' = 'fluss',
+              'bootstrap.servers' = 'coordinator-server:9123',
+              'paimon.s3.access-key' = 'rustfsadmin',
+              'paimon.s3.secret-key' = 'rustfsadmin'
+          );
+
+          USE CATALOG fluss_catalog;
+          USE gateway_demo;
+          SET 'execution.runtime-mode' = 'batch';
+
+          SELECT COUNT(*) AS union_count FROM orders;
+          SELECT order_id, customer, amount_cents, status
+          FROM orders
+          WHERE order_id = 4;
+          SQL
+
+          for i in {1..30}; do
+            output="$({
+              docker compose \
+                -f /tmp/gateway-lakehouse-compose.yaml \
+                run --rm -T sql-client \
+                bash -lc '/opt/flink/bin/sql-client.sh < /tmp/query-fresh-union.sql'
+            } 2>&1 || true)"
+
+            echo "$output"
+            if echo "$output" | grep -q 'Dave'; then
+              echo "Union Read sees order 4."
+              exit 0
+            fi
+
+            echo "Waiting for fresh Union Read result... ($i/30)"
+            sleep 3
+          done
+
+          echo "Timed out waiting for Union Read to see order 4." >&2
+          exit 1
+
+      # ------------------------------------------------------------
+      # Wait for order 4 to reach Paimon too.
+      # ------------------------------------------------------------
+      - name: Verify fresh record is eventually tiered
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat >/tmp/query-fresh-lake.sql <<'SQL'
+          CREATE CATALOG fluss_catalog WITH (
+              'type' = 'fluss',
+              'bootstrap.servers' = 'coordinator-server:9123',
+              'paimon.s3.access-key' = 'rustfsadmin',
+              'paimon.s3.secret-key' = 'rustfsadmin'
+          );
+
+          USE CATALOG fluss_catalog;
+          USE gateway_demo;
+          SET 'execution.runtime-mode' = 'batch';
+
+          SELECT COUNT(*) AS lake_rows FROM orders$lake;
+          SQL
+
+          for i in {1..60}; do
+            output="$({
+              docker compose \
+                -f /tmp/gateway-lakehouse-compose.yaml \
+                run --rm -T sql-client \
+                bash -lc '/opt/flink/bin/sql-client.sh < /tmp/query-fresh-lake.sql'
+            } 2>&1 || true)"
+
+            echo "$output"
+            if echo "$output" | grep -Eq '(^|[^0-9])4([^0-9]|$)'; then
+              echo "Four records are visible in Paimon."
+              exit 0
+            fi
+
+            echo "Waiting for order 4 to reach the lake... ($i/60)"
+            sleep 5
+          done
+
+          echo "Timed out waiting for order 4 to reach the lake." >&2
+          exit 1
+
+      # ------------------------------------------------------------
+      # Final end-to-end query.
+      # ------------------------------------------------------------
+      - name: Final end-to-end validation
+        shell: bash
+        run: |
+          cat >/tmp/query-final.sql <<'SQL'
+          CREATE CATALOG fluss_catalog WITH (
+              'type' = 'fluss',
+              'bootstrap.servers' = 'coordinator-server:9123',
+              'paimon.s3.access-key' = 'rustfsadmin',
+              'paimon.s3.secret-key' = 'rustfsadmin'
+          );
+
+          USE CATALOG fluss_catalog;
+          USE gateway_demo;
+          SET 'execution.runtime-mode' = 'batch';
+
+          SELECT COUNT(*) AS snapshot_count FROM orders$lake$snapshots;
+          SELECT COUNT(*) AS lake_count FROM orders$lake;
+          SELECT COUNT(*) AS union_count FROM orders;
+          SELECT order_id, customer, amount_cents, status FROM orders ORDER BY order_id;
+          SQL
+
+          docker compose \
+            -f /tmp/gateway-lakehouse-compose.yaml \
+            run --rm -T sql-client \
+            bash -lc '/opt/flink/bin/sql-client.sh < /tmp/query-final.sql' \
+            | tee /tmp/final-query.out
+
+          grep -q 'Alice' /tmp/final-query.out
+          grep -q 'Bob' /tmp/final-query.out
+          grep -q 'Carol' /tmp/final-query.out
+          grep -q 'Dave' /tmp/final-query.out
+
+      # ------------------------------------------------------------
+      # Cleanup exactly as documented.
       # ------------------------------------------------------------
       - name: Cleanup through Gateway
         shell: bash
         run: |
-          set -e
-
-          /tmp/gateway_request.sh DELETE \
+          /tmp/gateway_request.sh \
+            DELETE \
             http://localhost:8080/v1/clusters/default/databases/gateway_demo/tables/orders
 
-          /tmp/gateway_request.sh DELETE \
+          /tmp/gateway_request.sh \
+            DELETE \
             http://localhost:8080/v1/clusters/default/databases/gateway_demo
 
       # ------------------------------------------------------------
@@ -800,44 +762,20 @@ jobs:
         if: failure()
         shell: bash
         run: |
-          echo "================ docker compose ps ================"
-          docker compose \
-            -f /tmp/gateway-lakehouse-compose.yaml \
-            ps || true
+          docker compose -f /tmp/gateway-lakehouse-compose.yaml ps || true
+          echo "===== coordinator ====="
+          docker compose -f /tmp/gateway-lakehouse-compose.yaml logs --tail=300 coordinator-server || true
+          echo "===== tablet ====="
+          docker compose -f /tmp/gateway-lakehouse-compose.yaml logs --tail=300 tablet-server || true
+          echo "===== gateway ====="
+          docker compose -f /tmp/gateway-lakehouse-compose.yaml logs --tail=500 gateway || true
+          echo "===== jobmanager ====="
+          docker compose -f /tmp/gateway-lakehouse-compose.yaml logs --tail=500 jobmanager || true
+          echo "===== taskmanager ====="
+          docker compose -f /tmp/gateway-lakehouse-compose.yaml logs --tail=500 taskmanager || true
+          echo "===== rustfs ====="
+          docker compose -f /tmp/gateway-lakehouse-compose.yaml logs --tail=300 rustfs || true
 
-          echo "================ coordinator logs ================"
-          docker compose \
-            -f /tmp/gateway-lakehouse-compose.yaml \
-            logs --tail=200 coordinator-server || true
-
-          echo "================ tablet logs ================"
-          docker compose \
-            -f /tmp/gateway-lakehouse-compose.yaml \
-            logs --tail=200 tablet-server || true
-
-          echo "================ gateway logs ================"
-          docker compose \
-            -f /tmp/gateway-lakehouse-compose.yaml \
-            logs --tail=300 gateway || true
-
-          echo "================ jobmanager logs ================"
-          docker compose \
-            -f /tmp/gateway-lakehouse-compose.yaml \
-            logs --tail=300 jobmanager || true
-
-          echo "================ taskmanager logs ================"
-          docker compose \
-            -f /tmp/gateway-lakehouse-compose.yaml \
-            logs --tail=300 taskmanager || true
-
-          echo "================ rustfs logs ================"
-          docker compose \
-            -f /tmp/gateway-lakehouse-compose.yaml \
-            logs --tail=200 rustfs || true
-
-      # ------------------------------------------------------------
-      # Always tear down containers/volumes.
-      # ------------------------------------------------------------
       - name: Tear down Compose stack
         if: always()
         run: |
