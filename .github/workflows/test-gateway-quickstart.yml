@@ -444,7 +444,7 @@ jobs:
           method="$1"
           url="$2"
           data_file="${3:-}"
-          max_attempts=60
+          max_attempts=90
           sleep_seconds=5
           response_file="$(mktemp)"
 
