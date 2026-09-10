@@ -224,7 +224,7 @@ jobs:
           set -euo pipefail
 
           ./mvnw clean package \
-            -pl fluss-dist,fluss-flink \
+            -pl fluss-dist,fluss-flink,fluss-flink/fluss-flink-tiering \
             -am \
             -DskipTests \
             -DskipITs \
@@ -240,20 +240,25 @@ jobs:
             ls -lh fluss-dist/target/ || true
             exit 1
           }
-          TIERING_JAR="fluss-flink/fluss-flink-tiering/target/fluss-flink-tiering-${FLUSS_VERSION}.jar"
-          test -f "$TIERING_JAR" || {
-          echo "ERROR: tiering jar not found: $TIERING_JAR"
-          ls -lh fluss-flink/fluss-flink-tiering/target/ || true
-          exit 1
-          }
-          JAR_SIZE="$(stat -c%s "$TIERING_JAR")"
-          if [[ "$JAR_SIZE" -lt 1048576 ]]; then
-            echo "${JAR_SIZE} bytes , looks like thin jar" >&2
-            ls -lh fluss-flink/fluss-flink-tiering/target/ >&2
+          TIERING_JAR="$(find fluss-flink -name "fluss-flink-tiering-${FLUSS_VERSION}.jar" \
+          ! -name "original-*" | head -1)" 
+
+          if [[ -z "$TIERING_JAR" ]]; then
+            echo "ERROR: tiering jar not found anywhere under fluss-flink/" >&2
+            find fluss-flink -name "*.jar" | sort >&2
             exit 1
           fi
-          echo "Distribution tarball: $(du -sh $DIST_TGZ | cut -f1)"
-          echo "tiering jar: $(du -sh $TIERING_JAR)"
+
+          echo "Found tiering jar: $TIERING_JAR"
+
+          JAR_SIZE="$(stat -c%s "$TIERING_JAR")"
+          if [[ "$JAR_SIZE" -lt 1048576 ]]; then
+            echo "ERROR: tiering jar is only ${JAR_SIZE} bytes , looks like thin jar" >&2
+            find fluss-flink -name "*.jar" | sort >&2
+            exit 1
+          fi
+          echo "Distribution tarball: $(du -sh "$DIST_TGZ" | cut -f1)"
+          echo "Tiering jar: $(du -sh "$TIERING_JAR" | cut -f1)"
 
       - name: Prepare Fluss Docker build context
         shell: bash
