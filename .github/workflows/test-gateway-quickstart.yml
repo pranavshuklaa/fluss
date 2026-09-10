@@ -1,4 +1,4 @@
-name: Test Gateway Lakehouse Quickstart
+name: Test Gateway Lakehouse Quickstart (E2E)
 
 on:
   push:
@@ -6,12 +6,25 @@ on:
       - test/quickstart
   workflow_dispatch:
 
+env:
+  # The 1.0 development Flink quickstart image is built locally because the
+  # unreleased image is not expected to be available on Docker Hub.
+  # Update this when the Flink base version changes.
+  FLINK_QUICKSTART_DOCKER_VERSION: "1.20-1.0-SNAPSHOT"
+  COMPOSE_FILE: /tmp/gateway-lakehouse-compose.yaml
+  LIB_DIR: /tmp/lib
+  GATEWAY_URL: http://localhost:8080
+
 jobs:
   gateway-lakehouse-e2e:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # Increased from 60 min: Maven build + 3 Docker image builds need headroom.
+    timeout-minutes: 90
 
     steps:
+      # ----------------------------------------------------------
+      # Basic setup
+      # ----------------------------------------------------------
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -23,15 +36,70 @@ jobs:
           java-version: "11"
           distribution: temurin
 
-      - name: Show versions
+      # Cache the local Maven repository to speed up repeated CI runs.
+      - name: Cache Maven repository
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
+
+      - name: Show tool versions
+        shell: bash
         run: |
+          set -euo pipefail
           docker version
           docker compose version
           java -version
+          python3 --version
 
-      # ------------------------------------------------------------
+      # ----------------------------------------------------------
+      # Lint the quickstart doc before doing any heavy work.
+      # Catches broken Markdown links (space before '(') and any
+      # $PLACEHOLDER$ tokens that appear outside fenced code blocks.
+      # ----------------------------------------------------------
+      - name: Lint quickstart documentation
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DOC="website/docs/quickstart/gateway-lakehouse.md"
+          test -f "$DOC" || { echo "ERROR: $DOC not found"; exit 1; }
+
+          python3 - "$DOC" <<'PY'
+          import re
+          import sys
+
+          path = sys.argv[1]
+          text = open(path).read()
+          errors = []
+
+          # Check for broken Markdown links: "] (" with a space before the paren.
+          broken = re.findall(r'\]\s+\(https?://', text)
+          if broken:
+              errors.append(f"Broken Markdown link(s) — space before '(': {broken}")
+
+          # Strip fenced code blocks, then check for unresolved $PLACEHOLDER$ tokens.
+          stripped = re.sub(r'```.*?```', '', text, flags=re.S)
+          unresolved = re.findall(r'\$[A-Z][A-Z0-9_]*\$', stripped)
+          # $GATEWAY_URL$ and $CLUSTER$ are intentional shell variables in the doc.
+          false_positives = {'$GATEWAY_URL$', '$CLUSTER$', '$DATABASE$'}
+          real = [t for t in unresolved if t not in false_positives]
+          if real:
+              errors.append(f"Unresolved placeholder(s) outside code blocks: {real}")
+
+          if errors:
+              for e in errors:
+                  print(f"LINT ERROR: {e}", file=sys.stderr)
+              sys.exit(1)
+
+          print("Doc lint passed.")
+          PY
+
+      # ----------------------------------------------------------
       # Resolve the versions used by the documentation.
-      # ------------------------------------------------------------
+      # ----------------------------------------------------------
       - name: Resolve quickstart versions
         id: versions
         shell: bash
@@ -46,12 +114,17 @@ jobs:
           data = json.loads(Path("website/fluss-versions.json").read_text())
           next_version = next(v for v in data if v["versionName"] == "next")
 
-          fluss_version = next_version["fullVersion"]
+          fluss_version        = next_version["fullVersion"]
           fluss_docker_version = next_version["dockerVersion"]
-          paimon_version = next_version["paimonVersion"]
-          # The 1.0 development quickstart image is built locally because
-          # the unreleased image is not expected to be available on Docker Hub.
-          flink_docker_version = "1.20-1.0-SNAPSHOT"
+          paimon_version       = next_version["paimonVersion"]
+
+          # The 1.0 development Flink quickstart image is built locally.
+          # Read from the JSON if a key exists, otherwise fall back to the
+          # workflow-level env var set at the top of this file.
+          flink_docker_version = next_version.get(
+              "flinkQuickstartDockerVersion",
+              os.environ["FLINK_QUICKSTART_DOCKER_VERSION"],
+          )
 
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"fluss_version={fluss_version}\n")
@@ -59,83 +132,113 @@ jobs:
               f.write(f"paimon_version={paimon_version}\n")
               f.write(f"flink_docker_version={flink_docker_version}\n")
 
-          print(f"FLUSS_VERSION={fluss_version}")
-          print(f"FLUSS_DOCKER_VERSION={fluss_docker_version}")
-          print(f"PAIMON_VERSION={paimon_version}")
-          print(f"FLINK_DOCKER_VERSION={flink_docker_version}")
+          print(f"FLUSS_VERSION            = {fluss_version}")
+          print(f"FLUSS_DOCKER_VERSION     = {fluss_docker_version}")
+          print(f"PAIMON_VERSION           = {paimon_version}")
+          print(f"FLINK_DOCKER_VERSION     = {flink_docker_version}")
           PY
 
-      # ------------------------------------------------------------
+      # ----------------------------------------------------------
       # Extract the Compose example directly from the quickstart so the
       # test cannot drift from the documented Compose setup.
-      # ------------------------------------------------------------
+      # ----------------------------------------------------------
       - name: Prepare Compose file from documentation
         shell: bash
         env:
-          FLUSS_VERSION: ${{ steps.versions.outputs.fluss_version }}
-          FLUSS_DOCKER_VERSION: ${{ steps.versions.outputs.fluss_docker_version }}
-          PAIMON_VERSION: ${{ steps.versions.outputs.paimon_version }}
-          FLINK_DOCKER_VERSION: ${{ steps.versions.outputs.flink_docker_version }}
+          FLUSS_VERSION:                       ${{ steps.versions.outputs.fluss_version }}
+          FLUSS_DOCKER_VERSION:                ${{ steps.versions.outputs.fluss_docker_version }}
+          PAIMON_VERSION:                      ${{ steps.versions.outputs.paimon_version }}
+          FLUSS_QUICKSTART_FLINK_DOCKER_VERSION: ${{ steps.versions.outputs.flink_docker_version }}
         run: |
           set -euo pipefail
 
-          mkdir -p /tmp/lib
-
-          curl -fL --retry 3 --retry-delay 2 \
-            "https://repo.maven.apache.org/maven2/org/apache/paimon/paimon-s3/${PAIMON_VERSION}/paimon-s3-${PAIMON_VERSION}.jar" \
-            -o "/tmp/lib/paimon-s3-${PAIMON_VERSION}.jar"
-          test -s "/tmp/lib/paimon-s3-${PAIMON_VERSION}.jar"
+          DOC="website/docs/quickstart/gateway-lakehouse.md"
+          test -f "$DOC" || { echo "ERROR: $DOC not found"; exit 1; }
 
           python3 - <<'PY'
           import os
           import re
           from pathlib import Path
 
-          md = Path("website/docs/quickstart/gateway-lakehouse.md").read_text()
+          doc_path = "website/docs/quickstart/gateway-lakehouse.md"
+          md = Path(doc_path).read_text()
+
+          # Extract the first ```yaml ... ``` fenced block (the docker-compose).
           blocks = re.findall(r"```yaml\s*\n(.*?)```", md, re.S)
           if not blocks:
-              raise SystemExit("No YAML fenced block found in quickstart")
+              raise SystemExit(f"No YAML fenced block found in {doc_path}")
 
           compose = blocks[0]
+
           substitutions = {
-              "$FLUSS_VERSION$": os.environ["FLUSS_VERSION"],
-              "$FLUSS_DOCKER_VERSION$": os.environ["FLUSS_DOCKER_VERSION"],
-              "$PAIMON_VERSION$": os.environ["PAIMON_VERSION"],
-              "$FLUSS_QUICKSTART_FLINK_DOCKER_VERSION$": os.environ["FLINK_DOCKER_VERSION"],
+              "$FLUSS_VERSION$":                         os.environ["FLUSS_VERSION"],
+              "$FLUSS_DOCKER_VERSION$":                  os.environ["FLUSS_DOCKER_VERSION"],
+              "$PAIMON_VERSION$":                        os.environ["PAIMON_VERSION"],
+              "$FLUSS_QUICKSTART_FLINK_DOCKER_VERSION$": os.environ["FLUSS_QUICKSTART_FLINK_DOCKER_VERSION"],
           }
           for old, new in substitutions.items():
               compose = compose.replace(old, new)
 
           unresolved = re.findall(r"\$[A-Z][A-Z0-9_]*\$", compose)
           if unresolved:
-              raise SystemExit(f"Unresolved placeholders: {unresolved}")
+              raise SystemExit(f"Unresolved placeholders in Compose YAML: {unresolved}")
 
-          Path("/tmp/gateway-lakehouse-compose.yaml").write_text(compose)
+          out = "/tmp/gateway-lakehouse-compose.yaml"
+          Path(out).write_text(compose)
+          print(f"Compose file written to {out}")
           print(compose)
           PY
 
-          docker compose \
-            -f /tmp/gateway-lakehouse-compose.yaml \
-            config
+          # Validate the generated Compose file is syntactically correct.
+          docker compose -f /tmp/gateway-lakehouse-compose.yaml config --quiet
+          echo "Compose file validated successfully."
 
-      # ------------------------------------------------------------
+      # ----------------------------------------------------------
+      # Download the Paimon S3 plugin jar required by the Fluss servers.
+      # Done before the Maven build so a download failure is caught early.
+      # ----------------------------------------------------------
+      - name: Download Paimon S3 jar
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PAIMON_VERSION="${{ steps.versions.outputs.paimon_version }}"
+          mkdir -p "$LIB_DIR"
+
+          curl -fL --retry 3 --retry-delay 5 \
+            "https://repo.maven.apache.org/maven2/org/apache/paimon/paimon-s3/${PAIMON_VERSION}/paimon-s3-${PAIMON_VERSION}.jar" \
+            -o "${LIB_DIR}/paimon-s3-${PAIMON_VERSION}.jar"
+
+          test -s "${LIB_DIR}/paimon-s3-${PAIMON_VERSION}.jar"
+          echo "Downloaded paimon-s3-${PAIMON_VERSION}.jar ($(du -sh ${LIB_DIR}/paimon-s3-${PAIMON_VERSION}.jar | cut -f1))"
+
+      # ----------------------------------------------------------
       # Build only the Fluss distribution needed by the server image.
       # The distribution tarball contains the same /opt/fluss layout the
       # Dockerfile expects, without depending on the repository-wide
       # build-target symlink.
-      # ------------------------------------------------------------
-      - name: Build Fluss artifacts
+      # ----------------------------------------------------------
+      - name: Build Fluss distribution
+        shell: bash
         run: |
+          set -euo pipefail
+
           ./mvnw clean package \
-            -pl fluss-dist,fluss-flink/fluss-flink-tiering \
+            -pl fluss-dist \
             -am \
             -DskipTests \
             -DskipITs \
             -Dmaven.test.skip=true \
-            -T 1C
-      
-          test -f "fluss-dist/target/fluss-${{ steps.versions.outputs.fluss_version }}-bin.tgz"
-          test -d fluss-flink/fluss-flink-tiering/target
+            -T 1C \
+            --no-transfer-progress
+
+          DIST_TGZ="fluss-dist/target/fluss-${{ steps.versions.outputs.fluss_version }}-bin.tgz"
+          test -f "$DIST_TGZ" || {
+            echo "ERROR: expected distribution tarball not found: $DIST_TGZ"
+            ls -lh fluss-dist/target/ || true
+            exit 1
+          }
+          echo "Distribution tarball: $(du -sh $DIST_TGZ | cut -f1)"
 
       - name: Prepare Fluss Docker build context
         shell: bash
@@ -145,7 +248,7 @@ jobs:
           rm -rf /tmp/fluss-docker-context
           mkdir -p /tmp/fluss-docker-context/build-target
 
-          cp docker/fluss/Dockerfile /tmp/fluss-docker-context/
+          cp docker/fluss/Dockerfile          /tmp/fluss-docker-context/
           cp docker/fluss/docker-entrypoint.sh /tmp/fluss-docker-context/
 
           tar -xzf \
@@ -153,10 +256,12 @@ jobs:
             -C /tmp/fluss-docker-context/build-target \
             --strip-components=1
 
+          # Sanity-check the extracted layout.
           test -f /tmp/fluss-docker-context/Dockerfile
           test -f /tmp/fluss-docker-context/docker-entrypoint.sh
           test -d /tmp/fluss-docker-context/build-target/bin
           test -d /tmp/fluss-docker-context/build-target/lib
+          echo "Fluss Docker build context ready."
 
       - name: Build Fluss Docker image
         shell: bash
@@ -167,25 +272,27 @@ jobs:
             -t apache/fluss:${{ steps.versions.outputs.fluss_docker_version }} \
             /tmp/fluss-docker-context
 
-          docker image inspect \
-            apache/fluss:${{ steps.versions.outputs.fluss_docker_version }}
+          docker image inspect apache/fluss:${{ steps.versions.outputs.fluss_docker_version }} \
+            --format '{{.Id}} {{.RepoTags}}'
 
-      # ------------------------------------------------------------
+      # ----------------------------------------------------------
       # Build the local Gateway image referenced by the documentation.
-      # ------------------------------------------------------------
+      # ----------------------------------------------------------
       - name: Build Gateway Docker image
         shell: bash
         run: |
           set -euo pipefail
 
           docker/fluss-gateway/build.sh
-          docker image inspect fluss-gateway:dev
 
-      # ------------------------------------------------------------
+          docker image inspect fluss-gateway:dev \
+            --format '{{.Id}} {{.RepoTags}}'
+
+      # ----------------------------------------------------------
       # Build a matching 1.0 development Flink quickstart image locally.
-      # The branch may not yet contain prepare_build.sh, so use the current
-      # main version only as a temporary build helper on the CI runner.
-      # ------------------------------------------------------------
+      # Falls back to fetching prepare_build.sh from origin/main if the
+      # branch does not yet contain it.
+      # ----------------------------------------------------------
       - name: Prepare Flink quickstart build
         shell: bash
         run: |
@@ -195,6 +302,7 @@ jobs:
             RELEASE_VERSION="${{ steps.versions.outputs.fluss_version }}" \
               docker/quickstart-flink/prepare_build.sh
           else
+            echo "prepare_build.sh not on this branch — fetching from origin/main"
             git show origin/main:docker/quickstart-flink/prepare_build.sh \
               > docker/quickstart-flink/prepare_build.sh
             chmod +x docker/quickstart-flink/prepare_build.sh
@@ -211,58 +319,206 @@ jobs:
           docker buildx build \
             --load \
             --platform linux/amd64 \
+            --cache-from type=gha \
+            --cache-to   type=gha,mode=max \
             -t apache/fluss-quickstart-flink:${{ steps.versions.outputs.flink_docker_version }} \
             docker/quickstart-flink
 
           docker image inspect \
-            apache/fluss-quickstart-flink:${{ steps.versions.outputs.flink_docker_version }}
+            apache/fluss-quickstart-flink:${{ steps.versions.outputs.flink_docker_version }} \
+            --format '{{.Id}} {{.RepoTags}}'
 
-      # ------------------------------------------------------------
-      # Pull only registry-backed services. Fluss, Gateway and the Flink
+      # ----------------------------------------------------------
+      # Pull only registry-backed services. Fluss, Gateway, and the Flink
       # quickstart image were built locally above.
-      # ------------------------------------------------------------
+      # ----------------------------------------------------------
       - name: Pull external Compose images
+        shell: bash
         run: |
+          set -euo pipefail
           docker compose \
-            -f /tmp/gateway-lakehouse-compose.yaml \
+            -f "$COMPOSE_FILE" \
             pull rustfs rustfs-init zookeeper
 
-      # ------------------------------------------------------------
+      # ----------------------------------------------------------
       # Start the stack from the Compose block in the documentation.
-      # ------------------------------------------------------------
+      # ----------------------------------------------------------
       - name: Start Compose stack
+        shell: bash
         run: |
+          set -euo pipefail
+
+          # The Compose file mounts the paimon-s3 jar from $LIB_DIR.
+          # Create a symlink so the relative ./lib path in the Compose file
+          # resolves correctly when the file lives in /tmp/.
+          mkdir -p /tmp/lib
+          PAIMON_VERSION="${{ steps.versions.outputs.paimon_version }}"
+          # The Compose file uses ./lib/... relative to its own directory (/tmp/).
+          # The jar was downloaded to $LIB_DIR which is already /tmp/lib — no copy needed.
+
           docker compose \
-            -f /tmp/gateway-lakehouse-compose.yaml \
+            -f "$COMPOSE_FILE" \
             up -d
 
           docker compose \
-            -f /tmp/gateway-lakehouse-compose.yaml \
+            -f "$COMPOSE_FILE" \
             ps
 
-      # ------------------------------------------------------------
+      # ----------------------------------------------------------
       # Match the documented startup check, but add an explicit timeout.
-      # ------------------------------------------------------------
+      # Polls the actual /v1/clusters/default/databases endpoint — more
+      # meaningful than /health or /ready because it exercises Fluss
+      # connectivity end-to-end.
+      # ----------------------------------------------------------
       - name: Wait for Gateway and Fluss
         shell: bash
         run: |
           set -euo pipefail
 
-          for i in {1..90}; do
-            if curl -sS --fail \
-                http://localhost:8080/v1/clusters/default/databases \
-                >/tmp/gateway-databases.json; then
-              echo "Gateway can reach Fluss."
+          echo "Waiting for Gateway to reach Fluss (up to 180 s)..."
+          for i in $(seq 1 90); do
+            if curl -fsS \
+                "${GATEWAY_URL}/v1/clusters/default/databases" \
+                -o /tmp/gateway-databases.json 2>/dev/null; then
+              echo "Gateway is up and can reach Fluss."
               cat /tmp/gateway-databases.json
               exit 0
             fi
-
-            echo "Waiting for Gateway/Fluss... ($i/90)"
+            echo "  attempt $i/90 — retrying in 2 s..."
             sleep 2
           done
 
-          echo "Timed out waiting for Gateway to reach Fluss." >&2
-          docker compose -f /tmp/gateway-lakehouse-compose.yaml ps
+          echo "ERROR: Timed out waiting for Gateway to reach Fluss." >&2
+          docker compose -f "$COMPOSE_FILE" ps >&2
+          docker compose -f "$COMPOSE_FILE" logs --tail=50 gateway >&2
+          exit 1
+
+      # ----------------------------------------------------------
+      # Retry helper for the transient startup race between Gateway and
+      # the Fluss coordinator. Handles:
+      #   - HTTP 503 (Gateway not yet ready)
+      #   - HTTP 400 with a Fluss-connection error message (transient)
+      #   - HTTP 400 with code "unavailable" (transient)
+      # All other non-2xx responses fail immediately.
+      # ----------------------------------------------------------
+      - name: Write Gateway retry helper
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > /tmp/gateway_request.sh <<'SCRIPT'
+          #!/usr/bin/env bash
+          # Usage: gateway_request.sh METHOD URL [DATA_FILE]
+          # Writes the response body to stdout on success.
+          set -euo pipefail
+
+          method="$1"
+          url="$2"
+          data_file="${3:-}"
+          max_attempts=30
+          sleep_seconds=3
+          response_file="$(mktemp)"
+
+          cleanup() { rm -f "$response_file"; }
+          trap cleanup EXIT
+
+          for i in $(seq 1 "$max_attempts"); do
+            if [[ -n "$data_file" ]]; then
+              http_code="$(curl -sS -o "$response_file" -w '%{http_code}' \
+                -X "$method" \
+                -H 'Content-Type: application/json' \
+                --data "@$data_file" \
+                "$url")"
+            else
+              http_code="$(curl -sS -o "$response_file" -w '%{http_code}' \
+                -X "$method" \
+                "$url")"
+            fi
+
+            # Success.
+            if [[ "$http_code" == 2* ]]; then
+              cat "$response_file"
+              exit 0
+            fi
+
+            # Transient: Gateway not yet ready.
+            if [[ "$http_code" == "503" ]]; then
+              echo "Gateway returned HTTP 503; retrying ($i/$max_attempts)..." >&2
+              sleep "$sleep_seconds"
+              continue
+            fi
+
+            # Transient: Gateway returned 400 due to Fluss not yet reachable.
+            if [[ "$http_code" == "400" ]]; then
+              is_transient="$(python3 - "$response_file" <<'PY'
+          import json, sys
+          try:
+              body = json.loads(open(sys.argv[1]).read())
+          except Exception:
+              sys.exit(1)
+          error = body.get("error", {})
+          code = error.get("code", "")
+          msg  = error.get("message", "")
+          transient = (
+              code == "unavailable"
+              or (code == "invalid_argument" and "while trying to connect to Fluss" in msg)
+          )
+          sys.exit(0 if transient else 1)
+          PY
+              )" || true
+
+              if [[ $? -eq 0 ]]; then
+                echo "Gateway returned transient Fluss-connection HTTP 400; retrying ($i/$max_attempts)..." >&2
+                cat "$response_file" >&2
+                sleep "$sleep_seconds"
+                continue
+              fi
+            fi
+
+            # Non-transient failure.
+            echo "Gateway request failed with HTTP $http_code:" >&2
+            cat "$response_file" >&2
+            exit 1
+          done
+
+          echo "Gateway request timed out after $((max_attempts * sleep_seconds)) s." >&2
+          cat "$response_file" >&2
+          exit 1
+          SCRIPT
+
+          chmod +x /tmp/gateway_request.sh
+
+      # ----------------------------------------------------------
+      # Create the database exactly as documented.
+      # ----------------------------------------------------------
+      - name: Create database
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > /tmp/create-db.json <<'JSON'
+          {"database": "gateway_demo"}
+          JSON
+
+          /tmp/gateway_request.sh \
+            POST \
+            "${GATEWAY_URL}/v1/clusters/default/databases" \
+            /tmp/create-db.json
+
+      # ----------------------------------------------------------
+      # Create the lake-enabled orders table exactly as documented.
+      # ----------------------------------------------------------
+      - name: Create lake-enabled table
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > /tmp/create-table.json <<'JSON'
+          {
+            "table_name": "orders",
+            "columns": [
+              {"name": "order_id",     "data_type": {"type": "INTEGER"}, "nullable": false},
+              {"name": "customer",     "data_type": {"t
           exit 1
 
       # ------------------------------------------------------------
