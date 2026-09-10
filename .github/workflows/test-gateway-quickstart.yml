@@ -224,7 +224,7 @@ jobs:
           set -euo pipefail
 
           ./mvnw clean package \
-            -pl fluss-dist,fluss-flink/fluss-flink-tiering \
+            -pl fluss-dist,fluss-flink \
             -am \
             -DskipTests \
             -DskipITs \
@@ -240,12 +240,18 @@ jobs:
             ls -lh fluss-dist/target/ || true
             exit 1
           }
-          TIERING_JAR="fluss-flink/fluss-flink-tiering/target/fluss-flink-tiering-${FLUSS_VERSION}"
+          TIERING_JAR="fluss-flink/fluss-flink-tiering/target/fluss-flink-tiering-${FLUSS_VERSION}.jar"
           test -f "$TIERING_JAR" || {
           echo "ERROR: tiering jar not found: $TIERING_JAR"
           ls -lh fluss-flink/fluss-flink-tiering/target/ || true
           exit 1
           }
+          JAR_SIZE="$(stat -c%s "TIERING_JAR")"
+          if [["$JAR_SIZE" -lt 1048576]]; then
+            echo: "${JAR_SIZE} bytes , looks like thin jar" >&2
+            ls -lh fluss-flink/fluss-flink-tiering/target/ >&2
+            exit 1
+          fi
           echo "Distribution tarball: $(du -sh $DIST_TGZ | cut -f1)"
           echo "tiering jar: $(du -sh $TIERING_JAR)"
 
