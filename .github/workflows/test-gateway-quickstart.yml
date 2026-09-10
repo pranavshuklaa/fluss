@@ -246,9 +246,9 @@ jobs:
           ls -lh fluss-flink/fluss-flink-tiering/target/ || true
           exit 1
           }
-          JAR_SIZE="$(stat -c%s "TIERING_JAR")"
-          if [["$JAR_SIZE" -lt 1048576]]; then
-            echo: "${JAR_SIZE} bytes , looks like thin jar" >&2
+          JAR_SIZE="$(stat -c%s "$TIERING_JAR")"
+          if [[ "$JAR_SIZE" -lt 1048576]]; then
+            echo "${JAR_SIZE} bytes , looks like thin jar" >&2
             ls -lh fluss-flink/fluss-flink-tiering/target/ >&2
             exit 1
           fi
@@ -433,6 +433,7 @@ jobs:
           transient = (
             code == "unavailable"
             or (code == "invalid_argument" and "while trying to connect to Fluss" in msg)
+          )
           sys.exit(0 if transient else 1) 
           PYEOF
           cat > /tmp/gateway_request.sh <<'SCRIPT'
@@ -530,8 +531,23 @@ jobs:
             "table_name": "orders",
             "columns": [
               {"name": "order_id",     "data_type": {"type": "INTEGER"}, "nullable": false},
-              {"name": "customer",     "data_type": {"t
-          exit 1
+              {"name": "customer",     "data_type": {"type": "STRING"}, "nullable": false},
+              {"name": "amount_cents",     "data_type": {"type": "BIGINT"}, "nullable": false},
+              {"name": "status",     "data_type": {"type": "STRING"}, "nullable": false}
+            ],
+            "primary_key": ["order_id"],
+            "distribution": {"bucket_count": 1, "bucket_keys": ["order_id"] },
+            "configs": {
+              "table.datalake.enabled": "true",
+              "table.datalake.freshness": "30s"
+            }
+          }
+          JSON
+
+          /tmp/gateway_request.sh \
+          POST \
+          "${GATEWAY_URL}/v1/clusters/default/databases/gateway_demo/tables" \
+          /tmp/create-table.json
 
       # ------------------------------------------------------------
       # Retry helper for the transient startup race between Gateway and
