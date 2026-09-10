@@ -278,6 +278,20 @@ jobs:
             ! -name 'original-*' \
             -print -quit)"
       
+          echo "=== alljars =="
+          find fluss-flink -name '*.jar' | sort
+
+          echo "=== thin jar =="
+          jar tf "${tiering_jar}"
+
+          echo "=== original jars =="
+          jar tf "fluss-flink/fluss-flink-tiering/target/original-fluss-flink-tiering-1.0-SNAPSHOT.jar"
+
+          echo "=== tiering pom.xml =="
+          cat fluss-flink/fluss-flink-tiering/pom.xml
+
+
+          
           echo "Found tiering jar: ${tiering_jar}"
           size="$(stat -c '%s' "${tiering_jar}")"
           echo "Tiering jar size: ${size} bytes"
