@@ -260,6 +260,34 @@ jobs:
           echo "Distribution tarball: $(du -sh "$DIST_TGZ" | cut -f1)"
           echo "Tiering jar: $(du -sh "$TIERING_JAR" | cut -f1)"
 
+      - name: Build Lakehouse Tiering jar
+        shell: bash
+        run: |
+          set -euo pipefail
+      
+          ./mvnw package \
+            -pl fluss-flink,fluss-flink/fluss-flink-tiering \
+            -am \
+            -DskipTests \
+            -DskipITs \
+            -Dmaven.test.skip=true \
+            -T 1C
+      
+          tiering_jar="$(find fluss-flink/fluss-flink-tiering/target \
+            -name 'fluss-flink-tiering-*.jar' \
+            ! -name 'original-*' \
+            -print -quit)"
+      
+          echo "Found tiering jar: ${tiering_jar}"
+          size="$(stat -c '%s' "${tiering_jar}")"
+          echo "Tiering jar size: ${size} bytes"
+      
+          if [[ "$size" -lt 1000000 ]]; then
+            echo "ERROR: tiering jar is only ${size} bytes, looks like thin jar" >&2
+            find fluss-flink -name '*.jar' | sort >&2
+            exit 1
+          fi
+      
       - name: Prepare Fluss Docker build context
         shell: bash
         run: |
@@ -330,6 +358,13 @@ jobs:
               docker/quickstart-flink/prepare_build.sh
             rm -f docker/quickstart-flink/prepare_build.sh
           fi
+          tiering_jar="$(find fluss-flink/fluss-flink-tiering/target \
+            -name 'fluss-flink-tiering-*.jar' \
+            ! -name 'original-*' \
+            -print -quit)"
+          
+          cp "${tiering_jar}" \
+            "docker/quickstart-flink/fluss-flink-tiering-${{ steps.versions.outputs.fluss_version }}.jar"
 
       - name: Build Flink quickstart Docker image
         shell: bash
