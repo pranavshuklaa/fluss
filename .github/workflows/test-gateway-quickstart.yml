@@ -363,6 +363,7 @@ jobs:
         run: |
           set -euo pipefail
 
+
           # The Compose file mounts the paimon-s3 jar from $LIB_DIR.
           # Create a symlink so the relative ./lib path in the Compose file
           # resolves correctly when the file lives in /tmp/.
@@ -391,7 +392,7 @@ jobs:
           set -euo pipefail
 
           echo "Waiting for Gateway to reach Fluss (up to 180 s)..."
-          for i in $(seq 1 90); do
+          for i in $(seq 1 150); do
             if curl -fsS \
                 "${GATEWAY_URL}/v1/clusters/default/databases" \
                 -o /tmp/gateway-databases.json 2>/dev/null; then
@@ -399,7 +400,7 @@ jobs:
               cat /tmp/gateway-databases.json
               exit 0
             fi
-            echo "  attempt $i/90 — retrying in 2 s..."
+            echo "  attempt $i/150 — retrying in 2 s..."
             sleep 2
           done
 
@@ -420,7 +421,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
+          cat > /tmp/is_transient_error.py <<'PYEOF' 
+          import json, sys
+          try:
+            body = json.loads (open(sys.argv[1]).read())
+          except Exception:
+            sys.exit(1)
+          error = body.get ("error", {})
+          code = error.get("code", "")
+          msg = error.get("message", "")
+          transient = (
+            code == "unavailable"
+            or (code == "invalid_argument" and "while trying to connect to Fluss" in msg)
+          sys.exit(0 if transient else 1) 
+          PYEOF
           cat > /tmp/gateway_request.sh <<'SCRIPT'
           #!/usr/bin/env bash
           # Usage: gateway_request.sh METHOD URL [DATA_FILE]
@@ -430,8 +444,8 @@ jobs:
           method="$1"
           url="$2"
           data_file="${3:-}"
-          max_attempts=30
-          sleep_seconds=3
+          max_attempts=60
+          sleep_seconds=5
           response_file="$(mktemp)"
 
           cleanup() { rm -f "$response_file"; }
@@ -458,32 +472,15 @@ jobs:
 
             # Transient: Gateway not yet ready.
             if [[ "$http_code" == "503" ]]; then
-              echo "Gateway returned HTTP 503; retrying ($i/$max_attempts)..." >&2
+              echo "Gateway returned HTTP 503 gateway not ready yet; retrying ($i/$max_attempts)..." >&2
               sleep "$sleep_seconds"
               continue
             fi
 
             # Transient: Gateway returned 400 due to Fluss not yet reachable.
             if [[ "$http_code" == "400" ]]; then
-              is_transient="$(python3 - "$response_file" <<'PY'
-          import json, sys
-          try:
-              body = json.loads(open(sys.argv[1]).read())
-          except Exception:
-              sys.exit(1)
-          error = body.get("error", {})
-          code = error.get("code", "")
-          msg  = error.get("message", "")
-          transient = (
-              code == "unavailable"
-              or (code == "invalid_argument" and "while trying to connect to Fluss" in msg)
-          )
-          sys.exit(0 if transient else 1)
-          PY
-              )" || true
-
-              if [[ $? -eq 0 ]]; then
-                echo "Gateway returned transient Fluss-connection HTTP 400; retrying ($i/$max_attempts)..." >&2
+              if python3 /tmp/is_transient_error.py "$response_file"; then
+              echo "HTTP 400 transient fluss-connection error; retrying ($i/$max_attempts)..." >&2
                 cat "$response_file" >&2
                 sleep "$sleep_seconds"
                 continue
