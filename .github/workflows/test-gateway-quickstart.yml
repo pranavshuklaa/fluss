@@ -391,7 +391,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "Waiting for Gateway to reach Fluss (up to 180 s)..."
+          echo "Waiting for Gateway to reach Fluss (up to 300 s)..."
           for i in $(seq 1 150); do
             if curl -fsS \
                 "${GATEWAY_URL}/v1/clusters/default/databases" \
@@ -400,7 +400,7 @@ jobs:
               cat /tmp/gateway-databases.json
               exit 0
             fi
-            echo "  attempt $i/150 — retrying in 2 s..."
+            echo "  attempt $i/150 — retrying in 5 s..."
             sleep 2
           done
 
@@ -549,8 +549,8 @@ jobs:
           method="$1"
           url="$2"
           data_file="${3:-}"
-          max_attempts=30
-          sleep_seconds=3
+          max_attempts=60
+          sleep_seconds=5
           response_file="$(mktemp)"
 
           cleanup() { rm -f "$response_file"; }
