@@ -19,7 +19,7 @@ jobs:
   gateway-lakehouse-e2e:
     runs-on: ubuntu-latest
     # Increased from 60 min: Maven build + 3 Docker image builds need headroom.
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     steps:
       # ----------------------------------------------------------
@@ -224,7 +224,7 @@ jobs:
           set -euo pipefail
 
           ./mvnw clean package \
-            -pl fluss-dist \
+            -pl fluss-dist,fluss-flink/fluss-flink-tiering \
             -am \
             -DskipTests \
             -DskipITs \
@@ -232,13 +232,22 @@ jobs:
             -T 1C \
             --no-transfer-progress
 
-          DIST_TGZ="fluss-dist/target/fluss-${{ steps.versions.outputs.fluss_version }}-bin.tgz"
+          FLUSS_VERSION="${{ steps.versions.outputs.fluss_version }}"
+
+          DIST_TGZ="fluss-dist/target/fluss-${FLUSS_VERSION}-bin.tgz"
           test -f "$DIST_TGZ" || {
             echo "ERROR: expected distribution tarball not found: $DIST_TGZ"
             ls -lh fluss-dist/target/ || true
             exit 1
           }
+          TIERING_JAR="fluss-flink/fluss-flink-tiering/target/fluss-flink-tiering-${FLUSS_VERSION}"
+          test -f "$TIERING_JAR" || {
+          echo "ERROR: tiering jar not found: $TIERING_JAR"
+          ls -lh fluss-flink/fluss-flink-tiering/target/ || true
+          exit 1
+          }
           echo "Distribution tarball: $(du -sh $DIST_TGZ | cut -f1)"
+          echo "tiering jar: $(du -sh $TIERING_JAR)"
 
       - name: Prepare Fluss Docker build context
         shell: bash
@@ -299,14 +308,14 @@ jobs:
           set -euo pipefail
 
           if [[ -f docker/quickstart-flink/prepare_build.sh ]]; then
-            RELEASE_VERSION="${{ steps.versions.outputs.fluss_version }}" \
+            FLUSS_VERSION="${{ steps.versions.outputs.fluss_version }}" \
               docker/quickstart-flink/prepare_build.sh
           else
             echo "prepare_build.sh not on this branch — fetching from origin/main"
             git show origin/main:docker/quickstart-flink/prepare_build.sh \
               > docker/quickstart-flink/prepare_build.sh
             chmod +x docker/quickstart-flink/prepare_build.sh
-            RELEASE_VERSION="${{ steps.versions.outputs.fluss_version }}" \
+            FLUSS_VERSION="${{ steps.versions.outputs.fluss_version }}" \
               docker/quickstart-flink/prepare_build.sh
             rm -f docker/quickstart-flink/prepare_build.sh
           fi
