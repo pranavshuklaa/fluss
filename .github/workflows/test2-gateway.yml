@@ -224,7 +224,7 @@ jobs:
           set -euo pipefail
 
           ./mvnw clean package \
-            -pl fluss-dist,fluss-flink/fluss-flink-tiering \
+            -pl fluss-dist,fluss-flink,fluss-flink/fluss-flink-tiering \
             -am \
             -DskipTests \
             -DskipITs \
