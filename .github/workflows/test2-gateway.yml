@@ -218,13 +218,13 @@ jobs:
       # Dockerfile expects, without depending on the repository-wide
       # build-target symlink.
       # ----------------------------------------------------------
-      - name: Build Fluss distribution
+      - name: Build Fluss distribution and tiering jar
         shell: bash
         run: |
           set -euo pipefail
 
           ./mvnw clean package \
-            -pl fluss-dist,fluss-flink,fluss-flink/fluss-flink-tiering \
+            -pl fluss-dist,fluss-flink/fluss-flink-tiering \
             -am \
             -DskipTests \
             -DskipITs \
@@ -233,85 +233,41 @@ jobs:
             --no-transfer-progress
 
           FLUSS_VERSION="${{ steps.versions.outputs.fluss_version }}"
-
+          # verify the distribution tarball exists.
           DIST_TGZ="fluss-dist/target/fluss-${FLUSS_VERSION}-bin.tgz"
           test -f "$DIST_TGZ" || {
             echo "ERROR: expected distribution tarball not found: $DIST_TGZ"
             ls -lh fluss-dist/target/ || true
             exit 1
           }
-          TIERING_JAR="$(find fluss-flink -name "fluss-flink-tiering-${FLUSS_VERSION}.jar" \
-          ! -name "original-*" | head -1)" 
+          echo "=== All jars under fluss-flink-tiering/target ==="
+          find fluss-flink/fluss-flink-tiering/target -name '*.jar' | sort
+          TIERING_JAR="$(find fluss-flink/fluss-flink-tiering/target \
+          -name '*.jar' \
+          -printf '%s %p\n' | sort -rn | head -1 | awk '{print $2}')"
 
           if [[ -z "$TIERING_JAR" ]]; then
-            echo "ERROR: tiering jar not found anywhere under fluss-flink/" >&2
-            find fluss-flink -name "*.jar" | sort >&2
+            echo "ERROR: tiering jar not found anywhere under fluss-flink/fluss-flink-tiering/target" >&2
+            
             exit 1
           fi
 
-          echo "Found tiering jar: $TIERING_JAR"
-          echo "=== alljars =="
-          find fluss-flink -name '*.jar' | sort
-
-          echo "=== thin jar =="
-          jar tf "${tiering_jar}"
-
-          echo "=== original jars =="
-          jar tf "fluss-flink/fluss-flink-tiering/target/original-fluss-flink-tiering-1.0-SNAPSHOT.jar"
-
-          echo "=== tiering pom.xml =="
-          cat fluss-flink/fluss-flink-tiering/pom.xml
-
+  
+          echo "=== selected tiering jar: $TIERING_JAR"
           JAR_SIZE="$(stat -c%s "$TIERING_JAR")"
+          echo "Tiering jar size: ${JAR_SIZE} bytes"
+
+          
           if [[ "$JAR_SIZE" -lt 1048576 ]]; then
-            echo "ERROR: tiering jar is only ${JAR_SIZE} bytes , looks like thin jar" >&2
+            echo "ERROR: tiering jar is only ${JAR_SIZE} bytes , shade did not produce a fat jar" >&2
             find fluss-flink -name "*.jar" | sort >&2
             exit 1
           fi
           echo "Distribution tarball: $(du -sh "$DIST_TGZ" | cut -f1)"
           echo "Tiering jar: $(du -sh "$TIERING_JAR" | cut -f1)"
+          echo "TIERING_JAR=${TIERING_JAR}" >> "$GITHUB_ENV"
 
-      - name: Build Lakehouse Tiering jar
-        shell: bash
-        run: |
-          set -euo pipefail
       
-          ./mvnw package \
-            -pl fluss-flink,fluss-flink/fluss-flink-tiering \
-            -am \
-            -DskipTests \
-            -DskipITs \
-            -Dmaven.test.skip=true \
-            -T 1C
-      
-          tiering_jar="$(find fluss-flink/fluss-flink-tiering/target \
-            -name 'fluss-flink-tiering-*.jar' \
-            ! -name 'original-*' \
-            -print -quit)"
-      
-          echo "=== alljars =="
-          find fluss-flink -name '*.jar' | sort
-
-          echo "=== thin jar =="
-          jar tf "${tiering_jar}"
-
-          echo "=== original jars =="
-          jar tf "fluss-flink/fluss-flink-tiering/target/original-fluss-flink-tiering-1.0-SNAPSHOT.jar"
-
-          echo "=== tiering pom.xml =="
-          cat fluss-flink/fluss-flink-tiering/pom.xml
-
-
-          
-          echo "Found tiering jar: ${tiering_jar}"
-          size="$(stat -c '%s' "${tiering_jar}")"
-          echo "Tiering jar size: ${size} bytes"
-      
-          if [[ "$size" -lt 1000000 ]]; then
-            echo "ERROR: tiering jar is only ${size} bytes, looks like thin jar" >&2
-            find fluss-flink -name '*.jar' | sort >&2
-            exit 1
-          fi
       
       - name: Prepare Fluss Docker build context
         shell: bash
@@ -383,12 +339,9 @@ jobs:
               docker/quickstart-flink/prepare_build.sh
             rm -f docker/quickstart-flink/prepare_build.sh
           fi
-          tiering_jar="$(find fluss-flink/fluss-flink-tiering/target \
-            -name 'fluss-flink-tiering-*.jar' \
-            ! -name 'original-*' \
-            -print -quit)"
           
-          cp "${tiering_jar}" \
+          
+          cp "${TIERING_JAR}" \
             "docker/quickstart-flink/fluss-flink-tiering-${{ steps.versions.outputs.fluss_version }}.jar"
 
       - name: Build Flink quickstart Docker image
