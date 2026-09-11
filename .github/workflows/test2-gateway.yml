@@ -1,4 +1,4 @@
-name: Test99 Gateway Lakehouse Quickstart (E2E)
+name: Test3 Gateway Lakehouse Quickstart (E2E)
 
 on:
   push:
@@ -223,18 +223,13 @@ jobs:
         run: |
           set -euo pipefail
 
-          # NOTE: no -T 1C (parallel build) here. maven-shade-plugin has
-          # known issues under Maven's multi-threaded builder that can
-          # silently produce an incomplete/thin shaded jar even though the
-          # overall build reports SUCCESS. If the jar-size check below keeps
-          # passing reliably without -T 1C, that confirms it was the cause;
-          # only re-add -T 1C after that's verified.
           ./mvnw clean package \
             -pl fluss-dist,fluss-flink,fluss-flink/fluss-flink-tiering \
             -am \
             -DskipTests \
             -DskipITs \
             -Dmaven.test.skip=true \
+            -T 1C \
             --no-transfer-progress
 
           FLUSS_VERSION="${{ steps.versions.outputs.fluss_version }}"
@@ -245,8 +240,292 @@ jobs:
             ls -lh fluss-dist/target/ || true
             exit 1
           }
-
           TIERING_JAR="$(find fluss-flink -name "fluss-flink-tiering-${FLUSS_VERSION}.jar" \
+          ! -name "original-*" | head -1)" 
+
+          if [[ -z "$TIERING_JAR" ]]; then
+            echo "ERROR: tiering jar not found anywhere under fluss-flink/" >&2
+            find fluss-flink -name "*.jar" | sort >&2
+            exit 1
+          fi
+
+          echo "Found tiering jar: $TIERING_JAR"
+          echo "=== alljars =="
+          find fluss-flink -name '*.jar' | sort
+
+          echo "=== thin jar =="
+          jar tf "${tiering_jar}"
+
+          echo "=== original jars =="
+          jar tf "fluss-flink/fluss-flink-tiering/target/original-fluss-flink-tiering-1.0-SNAPSHOT.jar"
+
+          echo "=== tiering pom.xml =="
+          cat fluss-flink/fluss-flink-tiering/pom.xml
+
+          JAR_SIZE="$(stat -c%s "$TIERING_JAR")"
+          if [[ "$JAR_SIZE" -lt 1048576 ]]; then
+            echo "ERROR: tiering jar is only ${JAR_SIZE} bytes , looks like thin jar" >&2
+            find fluss-flink -name "*.jar" | sort >&2
+            exit 1
+          fi
+          echo "Distribution tarball: $(du -sh "$DIST_TGZ" | cut -f1)"
+          echo "Tiering jar: $(du -sh "$TIERING_JAR" | cut -f1)"
+
+      - name: Build Lakehouse Tiering jar
+        shell: bash
+        run: |
+          set -euo pipefail
+      
+          ./mvnw package \
+            -pl fluss-flink,fluss-flink/fluss-flink-tiering \
+            -am \
+            -DskipTests \
+            -DskipITs \
+            -Dmaven.test.skip=true \
+            -T 1C
+      
+          tiering_jar="$(find fluss-flink/fluss-flink-tiering/target \
+            -name 'fluss-flink-tiering-*.jar' \
+            ! -name 'original-*' \
+            -print -quit)"
+      
+          echo "=== alljars =="
+          find fluss-flink -name '*.jar' | sort
+
+          echo "=== thin jar =="
+          jar tf "${tiering_jar}"
+
+          echo "=== original jars =="
+          jar tf "fluss-flink/fluss-flink-tiering/target/original-fluss-flink-tiering-1.0-SNAPSHOT.jar"
+
+          echo "=== tiering pom.xml =="
+          cat fluss-flink/fluss-flink-tiering/pom.xml
+
+
+          
+          echo "Found tiering jar: ${tiering_jar}"
+          size="$(stat -c '%s' "${tiering_jar}")"
+          echo "Tiering jar size: ${size} bytes"
+      
+          if [[ "$size" -lt 1000000 ]]; then
+            echo "ERROR: tiering jar is only ${size} bytes, looks like thin jar" >&2
+            find fluss-flink -name '*.jar' | sort >&2
+            exit 1
+          fi
+      
+      - name: Prepare Fluss Docker build context
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf /tmp/fluss-docker-context
+          mkdir -p /tmp/fluss-docker-context/build-target
+
+          cp docker/fluss/Dockerfile          /tmp/fluss-docker-context/
+          cp docker/fluss/docker-entrypoint.sh /tmp/fluss-docker-context/
+
+          tar -xzf \
+            "fluss-dist/target/fluss-${{ steps.versions.outputs.fluss_version }}-bin.tgz" \
+            -C /tmp/fluss-docker-context/build-target \
+            --strip-components=1
+
+          # Sanity-check the extracted layout.
+          test -f /tmp/fluss-docker-context/Dockerfile
+          test -f /tmp/fluss-docker-context/docker-entrypoint.sh
+          test -d /tmp/fluss-docker-context/build-target/bin
+          test -d /tmp/fluss-docker-context/build-target/lib
+          echo "Fluss Docker build context ready."
+
+      - name: Build Fluss Docker image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker build \
+            -t apache/fluss:${{ steps.versions.outputs.fluss_docker_version }} \
+            /tmp/fluss-docker-context
+
+          docker image inspect apache/fluss:${{ steps.versions.outputs.fluss_docker_version }} \
+            --format '{{.Id}} {{.RepoTags}}'
+
+      # ----------------------------------------------------------
+      # Build the local Gateway image referenced by the documentation.
+      # ----------------------------------------------------------
+      - name: Build Gateway Docker image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker/fluss-gateway/build.sh
+
+          docker image inspect fluss-gateway:dev \
+            --format '{{.Id}} {{.RepoTags}}'
+
+      # ----------------------------------------------------------
+      # Build a matching 1.0 development Flink quickstart image locally.
+      # Falls back to fetching prepare_build.sh from origin/main if the
+      # branch does not yet contain it.
+      # ----------------------------------------------------------
+      - name: Prepare Flink quickstart build
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -f docker/quickstart-flink/prepare_build.sh ]]; then
+            FLUSS_VERSION="${{ steps.versions.outputs.fluss_version }}" \
+              docker/quickstart-flink/prepare_build.sh
+          else
+            echo "prepare_build.sh not on this branch — fetching from origin/main"
+            git show origin/main:docker/quickstart-flink/prepare_build.sh \
+              > docker/quickstart-flink/prepare_build.sh
+            chmod +x docker/quickstart-flink/prepare_build.sh
+            FLUSS_VERSION="${{ steps.versions.outputs.fluss_version }}" \
+              docker/quickstart-flink/prepare_build.sh
+            rm -f docker/quickstart-flink/prepare_build.sh
+          fi
+          tiering_jar="$(find fluss-flink/fluss-flink-tiering/target \
+            -name 'fluss-flink-tiering-*.jar' \
+            ! -name 'original-*' \
+            -print -quit)"
+          
+          cp "${tiering_jar}" \
+            "docker/quickstart-flink/fluss-flink-tiering-${{ steps.versions.outputs.fluss_version }}.jar"
+
+      - name: Build Flink quickstart Docker image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker buildx build \
+            --load \
+            --platform linux/amd64 \
+            --cache-from type=gha \
+            --cache-to   type=gha,mode=max \
+            -t apache/fluss-quickstart-flink:${{ steps.versions.outputs.flink_docker_version }} \
+            docker/quickstart-flink
+
+          docker image inspect \
+            apache/fluss-quickstart-flink:${{ steps.versions.outputs.flink_docker_version }} \
+            --format '{{.Id}} {{.RepoTags}}'
+
+      # ----------------------------------------------------------
+      # Pull only registry-backed services. Fluss, Gateway, and the Flink
+      # quickstart image were built locally above.
+      # ----------------------------------------------------------
+      - name: Pull external Compose images
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose \
+            -f "$COMPOSE_FILE" \
+            pull rustfs rustfs-init zookeeper
+
+      # ----------------------------------------------------------
+      # Start the stack from the Compose block in the documentation.
+      # ----------------------------------------------------------
+      - name: Start Compose stack
+        shell: bash
+        run: |
+          set -euo pipefail
+
+
+          # The Compose file mounts the paimon-s3 jar from $LIB_DIR.
+          # Create a symlink so the relative ./lib path in the Compose file
+          # resolves correctly when the file lives in /tmp/.
+          mkdir -p /tmp/lib
+          PAIMON_VERSION="${{ steps.versions.outputs.paimon_version }}"
+          # The Compose file uses ./lib/... relative to its own directory (/tmp/).
+          # The jar was downloaded to $LIB_DIR which is already /tmp/lib — no copy needed.
+
+          docker compose \
+            -f "$COMPOSE_FILE" \
+            up -d
+
+          docker compose \
+            -f "$COMPOSE_FILE" \
+            ps
+
+      # ----------------------------------------------------------
+      # Match the documented startup check, but add an explicit timeout.
+      # Polls the actual /v1/clusters/default/databases endpoint — more
+      # meaningful than /health or /ready because it exercises Fluss
+      # connectivity end-to-end.
+      # ----------------------------------------------------------
+      - name: Wait for Gateway and Fluss
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Waiting for Gateway to reach Fluss (up to 300 s)..."
+          for i in $(seq 1 150); do
+            if curl -fsS \
+                "${GATEWAY_URL}/v1/clusters/default/databases" \
+                -o /tmp/gateway-databases.json 2>/dev/null; then
+              echo "Gateway is up and can reach Fluss."
+              cat /tmp/gateway-databases.json
+              exit 0
+            fi
+            echo "  attempt $i/150 — retrying in 5 s..."
+            sleep 2
+          done
+
+          echo "ERROR: Timed out waiting for Gateway to reach Fluss." >&2
+          docker compose -f "$COMPOSE_FILE" ps >&2
+          docker compose -f "$COMPOSE_FILE" logs --tail=50 gateway >&2
+          exit 1
+
+      # ----------------------------------------------------------
+      # Retry helper for the transient startup race between Gateway and
+      # the Fluss coordinator. Handles:
+      #   - HTTP 503 (Gateway not yet ready)
+      #   - HTTP 400 with a Fluss-connection error message (transient)
+      #   - HTTP 400 with code "unavailable" (transient)
+      # All other non-2xx responses fail immediately.
+      # ----------------------------------------------------------
+      - name: Write Gateway retry helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/is_transient_error.py <<'PYEOF' 
+          import json, sys
+          try:
+            body = json.loads (open(sys.argv[1]).read())
+          except Exception:
+            sys.exit(1)
+          error = body.get ("error", {})
+          code = error.get("code", "")
+          msg = error.get("message", "")
+          transient = (
+            code == "unavailable"
+            or (code == "invalid_argument" and "while trying to connect to Fluss" in msg)
+          )
+          sys.exit(0 if transient else 1) 
+          PYEOF
+          cat > /tmp/gateway_request.sh <<'SCRIPT'
+          #!/usr/bin/env bash
+          # Usage: gateway_request.sh METHOD URL [DATA_FILE]
+          # Writes the response body to stdout on success.
+          set -euo pipefail
+
+          method="$1"
+          url="$2"
+          data_file="${3:-}"
+          max_attempts=90
+          sleep_seconds=5
+          response_file="$(mktemp)"
+
+          cleanup() { rm -f "$response_file"; }
+          trap cleanup EXIT
+
+          for i in $(seq 1 "$max_attempts"); do
+            if [[ -n "$data_file" ]]; then
+              http_code="$(curl -sS -o "$response_file" -w '%{http_code}' \
+                -X "$method" \
+                -H 'Content-Type: application/json' \
+                --data "@$data_file" \
+                "$url")"
+            else
+              http_code="$(curl -sS -o "$responiering-${FLUSS_VERSION}.jar" \
             ! -name "original-*" | head -1)"
 
           if [[ -z "$TIERING_JAR" ]]; then
